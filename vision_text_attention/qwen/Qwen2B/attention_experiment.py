@@ -275,8 +275,8 @@ total_caption = sum(r["total_caption"] for r in results)
 n_vision = sum(r["n_vision"] for r in results)
 n_caption = sum(r["n_caption"] for r in results)
 
-avg_vision = total_vision / (n_vision+n_caption)      # attention per single vision token
-avg_caption = total_caption / (n_caption+n_vision)   # attention per single caption token
+avg_vision = total_vision / (n_vision+n_caption)      # vision's attention share across all content tokens
+avg_caption = total_caption / (n_caption+n_vision)   # caption's attention share across all content tokens
 
 print("\n" + "=" * 50)
 print(f"Results over {len(results)} images")
@@ -293,13 +293,23 @@ print("=" * 50)
 # ---------------------------------------------------------------------------
 import numpy as np
 
-# sum each layer's attention across all images -> [n_layers]
+# sum each layer's attention across all images -> [n_layers] (totals chart)
 vision_layer = torch.stack([r["vision_per_layer"] for r in results]).sum(0).numpy()
 caption_layer = torch.stack([r["caption_per_layer"] for r in results]).sum(0).numpy()
 
-# per-token version (fairer trend: divide by token counts, constant across layers)
-vision_layer_pertok = vision_layer / n_vision
-caption_layer_pertok = caption_layer / n_caption
+# per-token version (fairer trend). Compute each IMAGE's per-token attention at
+# each layer FIRST (its own layer curve), then average those curves across
+# images so every image is weighted equally. This preserves the layer-by-layer
+# trend, unlike pooling all tokens into one global bucket and dividing once
+# (which lets token-heavy images dominate and flattens the trend).
+vision_pertok_by_image = torch.stack(
+    [r["vision_per_layer"] / r["n_vision"] for r in results]
+)   # [n_images, n_layers]
+caption_pertok_by_image = torch.stack(
+    [r["caption_per_layer"] / r["n_caption"] for r in results]
+)   # [n_images, n_layers]
+vision_layer_pertok = vision_pertok_by_image.mean(0).numpy()    # [n_layers]
+caption_layer_pertok = caption_pertok_by_image.mean(0).numpy()  # [n_layers]
 
 np.savez(
     "layer_attention.npz",
