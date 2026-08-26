@@ -36,7 +36,7 @@ fig, axes = plt.subplots(1, 3, figsize=(12, 4.2))
 panels = [
     ("Number of tokens", [n_vision, n_caption], "{:,.0f}"),
     ("Total attention received", [total_vision, total_caption], "{:,.0f}"),
-    ("Avg attention per token", [avg_vision, avg_caption], "{:,.1f}"),
+    ("Avg attention per token", [avg_vision, avg_caption], "{:,.4f}"),
 ]
 
 for ax, (title, values, fmt) in zip(axes, panels):
@@ -62,4 +62,4 @@ fig.suptitle(
 )
 fig.tight_layout(rect=[0, 0, 1, 0.92])
 fig.savefig("attention_chart.png", dpi=150)
-print(f"saved attention_chart.png  (vision/token={avg_vision:.1f}, caption/token={avg_caption:.1f})")
+print(f"saved attention_chart.png  (vision/token={avg_vision:.3f}, caption/token={avg_caption:.3f})")

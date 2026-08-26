@@ -65,8 +65,11 @@ def _attn_hook(module, inputs, output):
     if not isinstance(output, tuple) or len(output) < 2 or output[1] is None:
         return output
     attn = output[1]                     # [batch, heads, query, key]
-    # accumulate in float32 (bf16 sums over thousands of terms lose precision)
-    received = attn[0].sum(dim=(0, 1), dtype=torch.float32)  # sum heads+query -> [key]
+    # Attention FROM the final input token only (the position that decides the
+    # next generation), summed over heads -> [key]. Taking just the last query
+    # removes the causal-position confound of summing over ALL queries (early
+    # tokens like vision patches are reachable by more queries and look inflated).
+    received = attn[0][:, -1, :].sum(dim=0, dtype=torch.float32)  # [key]
     # Only language-model layers match the full input length; skip the vision
     # tower's attention (different key length).
     if received.shape[0] != _cap.get("seq_len"):
@@ -88,20 +91,20 @@ for _name, _module in model.named_modules():
 # ---------------------------------------------------------------------------
 import io
 import requests
-from datasets import load_dataset
+import pandas as pd
+from huggingface_hub import hf_hub_download
 
-# PixelProse original repo: `vlm_caption` = long detailed Gemini caption, `url` =
-# image URL (must be downloaded). Stream so we don't pull all rows.
-dataset = load_dataset(
-    "tomg-group-umd/pixelprose",
-    split="train",
-    streaming=True,
-)
-
-# Randomize which samples we draw (instead of always the first 50). shuffle on a
-# streaming dataset fills a buffer and samples randomly from it.
-SEED = 42
-dataset = dataset.shuffle(seed=SEED, buffer_size=1000)
+# PixelProse: `vlm_caption` = long detailed Gemini caption, `url` = image URL
+# (downloaded per-sample below). We read ONE local parquet shard instead of HTTP
+# streaming, which kept dropping connections mid-run. cc12m_05 is a different
+# shard from the candidate-vector validation (cc12m_09); held-out-ness doesn't
+# matter here since this just measures attention on random images. hf_hub_download
+# caches the file: one ~65MB download the first time, instant on every re-run.
+SHARD = "data/vlm_captions_cc12m_05.parquet"
+_local_parquet = hf_hub_download("tomg-group-umd/pixelprose", SHARD, repo_type="dataset")
+df = pd.read_parquet(_local_parquet, columns=["url", "vlm_caption"])
+df = df.sample(frac=1.0, random_state=42).reset_index(drop=True)   # shuffle (seed 42)
+print(f"Loaded {len(df)} rows from {SHARD}.")
 
 QUESTION = "What is in the image?"
 
@@ -181,22 +184,22 @@ def build_inputs(image, caption):
 # Main loop: run first 100 samples through the model
 # ---------------------------------------------------------------------------
 N_SAMPLES = 50
-MAX_VISION_TOKENS = 800  # skip huge/high-res images that blow up memory + time
+MAX_VISION_TOKENS = 1000  # skip huge/high-res images that blow up memory + time
 
 results = []  # one entry per successfully-run image
 
 seen = 0
-for sample in dataset:
+for sample in df.itertuples(index=False):
     if seen >= N_SAMPLES:
         break
 
-    image = fetch_image(sample["url"])  # download from URL
+    image = fetch_image(sample.url)  # download from URL
     if image is None:
         continue  # dead url, skip (does not count toward the 50)
 
-    caption = sample["vlm_caption"]  # long detailed Gemini caption
-    if not caption:
-        continue  # no caption, skip
+    caption = sample.vlm_caption  # long detailed Gemini caption
+    if not isinstance(caption, str) or not caption.strip():
+        continue  # no/blank caption, skip
 
     inputs, caption_mask = build_inputs(image, caption)
 
@@ -225,6 +228,12 @@ for sample in dataset:
     _cap["vision_per_layer"] = []
     _cap["caption_per_layer"] = []
 
+    # announce BEFORE the (slow, on CPU) forward pass so progress is visible
+    print(
+        f"[{seen + 1}/{N_SAMPLES}] processing: n_vis={n_vis}, "
+        f"n_cap={int(caption_mask.sum())} ...",
+        flush=True,
+    )
     with torch.no_grad():
         model(**inputs, output_attentions=True, use_cache=False)  # hooks capture + drop
 
@@ -275,8 +284,8 @@ total_caption = sum(r["total_caption"] for r in results)
 n_vision = sum(r["n_vision"] for r in results)
 n_caption = sum(r["n_caption"] for r in results)
 
-avg_vision = total_vision / (n_vision+n_caption)      # vision's attention share across all content tokens
-avg_caption = total_caption / (n_caption+n_vision)   # caption's attention share across all content tokens
+avg_vision = total_vision / n_vision      # attention a typical vision token gets from the last token
+avg_caption = total_caption / n_caption   # attention a typical caption token gets from the last token
 
 print("\n" + "=" * 50)
 print(f"Results over {len(results)} images")
