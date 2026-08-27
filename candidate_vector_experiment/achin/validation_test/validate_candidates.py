@@ -48,7 +48,7 @@ if image_token_id is None:
 # ---------------------------------------------------------------------------
 # STAGE 1: load the candidate vectors + sanity-check they match this model
 # ---------------------------------------------------------------------------
-VEC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "candidate_vectors.pt")
+VEC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "candidate_vectors", "candidate_vectors.pt")
 blob = torch.load(VEC_PATH, weights_only=False)
 
 # Tripwires: crash loudly now if the file doesn't match the model we just loaded,
@@ -240,7 +240,7 @@ def separability(pv_cal, pc_cal, pv_test, pc_test):
 
 
 print(f"{'layer':>5} {'ratio':>8} {'mean|act|':>10} {'cand':>6} | "
-      f"{'vis_avg':>8} {'cap_avg':>8} {'thr':>7} | {'acc':>6} {'bal_acc':>8} {'rand_bal':>9}")
+      f"{'vis_avg':>8} {'cap_avg':>8} {'mid':>7} | {'acc':>6} {'bal_acc':>8} {'rand_bal':>9}")
 print("-" * 95)
 
 # accumulate every per-layer metric so we can save + re-plot without re-running

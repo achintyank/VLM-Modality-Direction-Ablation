@@ -37,7 +37,7 @@ ax.legend(loc="lower left", framealpha=0.9)
 
 plt.title(
     "Modality separability: candidate direction vs. random baseline\n"
-    f"Qwen2-VL-2B, threshold fit on {r.get('n_calib', '?')} calib pairs, "
+    f"Qwen2-VL-2B, midpoint fit on {r.get('n_calib', '?')} calib pairs, "
     f"scored on {r.get('n_test', '?')} test pairs"
 )
 fig.tight_layout()

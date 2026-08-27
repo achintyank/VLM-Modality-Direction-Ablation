@@ -20,7 +20,7 @@ cols = [
     ("cand_norm", "Candidate\nnorm", "{:.1f}"),
     ("vis_avg", "vis_avg", "{:.2f}"),
     ("cap_avg", "cap_avg", "{:.2f}"),
-    ("thr", "thr", "{:.2f}"),
+    ("thr", "mid", "{:.2f}"),
     ("acc", "acc", "{:.3f}"),
     ("bal_acc", "bal_acc", "{:.3f}"),
     ("rand_bal", "rand_bal", "{:.3f}"),
@@ -61,7 +61,7 @@ for (row, col), cell in tbl.get_celld().items():
 
 plt.title(
     "Per-layer candidate-vector validation (Qwen2-VL-2B)\n"
-    f"threshold fit on {r.get('n_calib','?')} calibration pairs, scored on "
+    f"midpoint fit on {r.get('n_calib','?')} calibration pairs, scored on "
     f"{r.get('n_test','?')} test pairs; rand_bal = mean over {r.get('n_rand','?')} random dirs",
     fontsize=10, pad=12,
 )
