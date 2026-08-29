@@ -1,4 +1,3 @@
-%%writefile vision_text_attention.py
 """
 Experiment: measure total attention mass allocated to text vs vision tokens
 in a VLM (Qwen2-VL-7B-Instruct), streaming images directly from PixelProse.
