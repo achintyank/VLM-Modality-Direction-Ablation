@@ -35,7 +35,7 @@ print(f"Model loaded on {device}.")
 # ---------------------------------------------------------------------------
 # Collect 50 (image, caption) pairs from PixelProse (detailed vlm_caption)
 # ---------------------------------------------------------------------------
-N_PAIRS = 50
+N_PAIRS = 500
 PROMPT_TEXT = "What is in the image?"
 
 # tomg-group-umd/pixelprose: `vlm_caption` = long detailed Gemini caption,
