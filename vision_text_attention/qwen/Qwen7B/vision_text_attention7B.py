@@ -121,7 +121,7 @@ def build_inputs(image, caption):
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-N_SAMPLES = 3   # <-- small test run first; bump up once confirmed working
+N_SAMPLES = 500
 MAX_VISION_TOKENS = 800
 
 results = []
