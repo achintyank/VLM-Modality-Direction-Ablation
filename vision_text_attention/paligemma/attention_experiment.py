@@ -171,7 +171,7 @@ def build_inputs(image, caption):
 # ---------------------------------------------------------------------------
 # Main loop: run first 100 samples through the model
 # ---------------------------------------------------------------------------
-N_SAMPLES = 50
+N_SAMPLES = 500
 MAX_VISION_TOKENS = 800  # skip huge/high-res images that blow up memory + time
 
 results = []  # one entry per successfully-run image
