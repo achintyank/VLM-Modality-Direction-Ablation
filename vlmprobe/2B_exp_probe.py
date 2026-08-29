@@ -20,7 +20,7 @@ processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct") # we crea
 
 # load dataset
 dataset = load_dataset("tomg-group-umd/pixelprose", split = "train", streaming=True) # we do split = "train" not because we're training but because the data that we need is under the training split, streaming feeds one row at a time instead of downloading all that at once, bc of this we can't do len()
-N_EXAMPLES  = 40 # this is the number of examples we will test with
+N_EXAMPLES  = 500 # this is the number of examples we will test with
 activations = {L: [] for L in list(range(1,29))} # collect for ALL layers
 labels = {L: [] for L in list(range(1,29))}
 count = 0 # counts how many successful images you process, you want this to become equal to N_EXAMPLES
