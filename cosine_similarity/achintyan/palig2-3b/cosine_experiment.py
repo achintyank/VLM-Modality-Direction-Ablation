@@ -1,15 +1,21 @@
 """
-cosine_experiment.py — cosine-similarity modality-gap experiment (Qwen2-VL-2B).
+cosine_experiment.py — cosine-similarity modality-gap experiment (PaliGemma2-3B).
 
-Per layer (hidden_states[1..28]), measure how similar the AVERAGE vision-token
+Per layer (hidden_states[1..N]), measure how similar the AVERAGE vision-token
 representation is to the AVERAGE text-token representation (cosine), for:
   - a BASELINE run (unmodified), and
   - an ABLATED run: the candidate vector (from compute_candidates.py) projected
-    out of hidden_states[0] ONLY, before block 1, propagating onward.
+    out of the VISION token embeddings in hidden_states[0] ONLY, before block 1,
+    propagating onward. Text/caption embeddings are NOT modified.
 Then plot both cosine curves across layers to see if/where the modality gap closes
 and how the input-ablation changes that trajectory.
 
   - text = ALL non-vision tokens (input_ids != image_token_id).
+  - ARCHITECTURE CAVEAT: PaliGemma attends BIDIRECTIONALLY over the prefix
+    (image + prompt) and causally only over the suffix, whereas Qwen2-VL is
+    causal throughout. Vision tokens here can therefore see the caption
+    tokens directly. Curves are comparable to the Qwen ones in shape, but a
+    difference between models may come from this masking, not from scale.
   - cosine per layer = mean over pairs of cos(that pair's mean vision vector,
     that pair's OWN mean text vector). One cosine per pair, THEN averaged, so the
     image/caption correspondence survives the aggregation.
@@ -17,10 +23,11 @@ and how the input-ablation changes that trajectory.
     cosine — averaged the pairing away before comparing and was therefore nearly
     blind to semantic alignment. It is still computed and saved as "grandmean"
     for continuity, but it is no longer the headline number.)
-  - each run also reports a "cross" control: the same per-pair means, with each
-    image compared against the NEXT pair's text. Same forward passes, same
-    activations, only the correspondence broken — so paired vs cross isolates
-    semantic alignment with everything else held exactly fixed.
+  - each run also SAVES (but does not plot) a "cross" control: the same per-pair
+    means, with each image compared against the NEXT pair's text. Same forward
+    passes, same activations, only the correspondence broken. It is in the JSON
+    for reference; the mismatched-pairs experiment is where that comparison is
+    actually made. This figure stays the plain baseline-vs-ablated chart.
   - baseline and ablated use DIFFERENT pairs (different shards); the candidate
     vector came from a third, separate set (compute_candidates.py, cc12m_03).
 
@@ -35,30 +42,72 @@ import requests
 import torch
 from huggingface_hub import hf_hub_download
 from PIL import Image
-from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
 # ---------------------------------------------------------------------------
-# Load Qwen2-VL-2B (same model the candidate vector was built on)
+# Load PaliGemma2-3B pt-224 (same model the candidate vector must be built on)
 # ---------------------------------------------------------------------------
-MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
+MODEL_ID = "google/paligemma2-3b-pt-224"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16
 
-model = Qwen2VLForConditionalGeneration.from_pretrained(MODEL_ID, torch_dtype=dtype).to(device)
+# PaliGemma2 is a gated repo on the Hub — `huggingface-cli login` first, or the
+# from_pretrained below 401s. AutoModelForImageTextToText resolves the right class
+# from the config rather than hardcoding one.
+model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, torch_dtype=dtype).to(device)
 model.eval()
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 print(f"Model loaded on {device}.")
 
-image_token_id = getattr(model.config, "image_token_id", None)
+# PaliGemma names this image_token_index, Qwen names it image_token_id — check
+# both, then fall back to looking up the <image> token in the tokenizer.
+image_token_id = getattr(model.config, "image_token_index", None)
 if image_token_id is None:
-    image_token_id = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    image_token_id = getattr(model.config, "image_token_id", None)
+if image_token_id is None:
+    image_token_id = processor.tokenizer.convert_tokens_to_ids("<image>")
+assert image_token_id is not None, "could not resolve the image token id"
+
+
+# ---------------------------------------------------------------------------
+# Load the candidate vector NOW (before any forward passes) and tripwire it
+# ---------------------------------------------------------------------------
+# The single embedding-level candidate vector (hidden_states[0]) from
+# compute_candidates.py, normalized to a unit direction. Loaded up here on
+# purpose: a mismatched vector must fail immediately, not after a few hundred
+# forward passes. d_model differs across models (1536 on Qwen2-VL-2B, 3584 on the
+# 7B, and whatever this config reports), so building the vector under one
+# MODEL_ID and ablating under another blows up mid-run.
+CAND_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "candidate_vector.pt")
+_cand_blob = torch.load(CAND_PATH, weights_only=False)
+_cand = _cand_blob["candidate"].float()
+
+_d_model = model.config.get_text_config().hidden_size
+assert _cand_blob["model_id"] == MODEL_ID, (
+    f"candidate_vector.pt was built for {_cand_blob['model_id']}, but this run "
+    f"uses {MODEL_ID}. Set the same MODEL_ID in compute_candidates.py and rebuild it.")
+assert _cand.shape[0] == _d_model, (
+    f"candidate vector is {_cand.shape[0]}-dim but {MODEL_ID} has d_model={_d_model}. "
+    f"Rebuild candidate_vector.pt with compute_candidates.py under this model.")
+assert _cand_blob["level"] == "hidden_states[0]", (
+    f"candidate vector lives at {_cand_blob['level']}, not hidden_states[0]; this "
+    f"experiment ablates at the embedding level only.")
+
+vhat = (_cand / torch.linalg.vector_norm(_cand)).to(device)      # unit direction [d_model]
+print(f"Loaded candidate vector ({_cand_blob['level']}, d={_cand.shape[0]}) built from "
+      f"{_cand_blob['n_pairs']} pairs on {_cand_blob['shard']} — matches {MODEL_ID}.")
 
 
 # ---------------------------------------------------------------------------
 # Step 1: pull 500 random BASELINE image+caption pairs (local shard)
 # ---------------------------------------------------------------------------
 N_PAIRS = 500
+# pt-224 encodes EVERY image to exactly 256 tokens (a fixed 224x224 / 14px grid,
+# unlike Qwen2-VL's variable count), so these bounds never actually reject an
+# image here. They are kept as a tripwire: if n_vis is ever not 256, the
+# processor is not doing what this script assumes.
+EXPECTED_VISION_TOKENS = 256
 MAX_VISION_TOKENS = 1000
 MIN_VISION_TOKENS = 4
 PROMPT_TEXT = "What is in the image?"
@@ -81,14 +130,14 @@ def fetch_image(url, timeout=10):
 
 
 def build_inputs(image, caption):
-    """image + caption + question via the Qwen2-VL chat template."""
+    """image + caption + question, PaliGemma style.
+
+    NOT the Qwen path: paligemma2-3b-pt-224 is a PRETRAINED checkpoint with no
+    chat template, so apply_chat_template does not apply. The processor takes the
+    raw prompt string and the image directly — it prepends the 256 <image>
+    tokens, then BOS, the prompt, and a trailing newline."""
     text = f"{caption}\n{PROMPT_TEXT}"
-    messages = [{"role": "user", "content": [
-        {"type": "image", "image": image},
-        {"type": "text", "text": text},
-    ]}]
-    chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return processor(text=[chat_text], images=[image], return_tensors="pt").to(device)
+    return processor(text=text, images=image, return_tensors="pt").to(device)
 
 
 def pull_pairs(df, n):
@@ -106,6 +155,8 @@ def pull_pairs(df, n):
             continue
         inputs = build_inputs(image, caption)
         n_vis = int((inputs["input_ids"][0] == image_token_id).sum())
+        assert n_vis == EXPECTED_VISION_TOKENS, (
+            f"expected {EXPECTED_VISION_TOKENS} vision tokens from {MODEL_ID}, got {n_vis}")
         if n_vis < MIN_VISION_TOKENS or n_vis >= MAX_VISION_TOKENS:
             continue
         pairs.append((image, caption))
@@ -121,7 +172,11 @@ print(f"\nPulled {len(baseline_pairs)} baseline pairs.")
 # Step 2: BASELINE per-layer cosine(avg vision vector, avg text vector)
 # ---------------------------------------------------------------------------
 _text_config = model.config.get_text_config()
-N_LAYERS = getattr(model.config, "num_hidden_layers", None) or _text_config.num_hidden_layers  # 28
+# Read the TEXT stack's depth first: on some VLM configs a top-level
+# num_hidden_layers describes the vision tower, which would silently give the
+# wrong layer range here.
+N_LAYERS = getattr(_text_config, "num_hidden_layers", None) or model.config.num_hidden_layers
+print(f"{MODEL_ID.split('/')[-1]}: {N_LAYERS} text layers, d_model={_text_config.hidden_size}")
 
 
 def measure_cosine_per_layer(pairs):
@@ -159,6 +214,10 @@ def measure_cosine_per_layer(pairs):
         vision_mask = ids == image_token_id
         text_mask = ~vision_mask               # ALL non-vision tokens = text
         print(f"  [{i + 1}/{len(pairs)}] forward ...", flush=True)
+        # Publish this sequence's vision mask for the ablation hook. Harmless on an
+        # unablated run (no hook is registered), required on an ablated one.
+        global CURRENT_VISION_MASK
+        CURRENT_VISION_MASK = vision_mask.to(device)
         with torch.no_grad():
             out = model(**inputs, output_hidden_states=True)
         for L in layers:
@@ -201,26 +260,62 @@ print(f"\nLoaded {len(ablated_df)} rows from {ABLATED_SHARD}.")
 ablated_pairs = pull_pairs(ablated_df, N_PAIRS)
 print(f"\nPulled {len(ablated_pairs)} ablated pairs.")
 
-# Load the single embedding-level candidate vector (hidden_states[0]) and normalize.
-CAND_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "candidate_vector.pt")
-_cand_blob = torch.load(CAND_PATH, weights_only=False)
-_cand = _cand_blob["candidate"].float()
-vhat = (_cand / torch.linalg.vector_norm(_cand)).to(device)      # unit direction [d_model]
-print(f"Loaded candidate vector ({_cand_blob['level']}) built from {_cand_blob['n_pairs']} pairs.")
 
 # Forward-PRE-hook on the FIRST decoder layer: its input is hidden_states[0] (the
-# embeddings, before block 1). Project v_hat out of every token there; it then
-# propagates through all 28 blocks. No other layer is touched.
-decoder_layers = [m for _, m in model.named_modules()
-                  if m.__class__.__name__.endswith("DecoderLayer")]
-first_layer = decoder_layers[0]
+# embeddings, before block 1). Project v_hat out of the VISION tokens there ONLY;
+# it then propagates through every following block. Text embeddings are left
+# untouched, and no other layer is touched.
+def first_decoder_layer(model):
+    """Block 1 of the LANGUAGE model. Walk the known attribute paths first: a
+    class-name filter over named_modules() is fragile across architectures, since
+    a vision tower whose blocks also end in 'DecoderLayer' would sort ahead of the
+    text stack and we would ablate the wrong thing entirely."""
+    for path in (("model", "language_model", "layers"),
+                 ("model", "layers"),
+                 ("language_model", "layers"),
+                 ("model", "text_model", "layers")):
+        obj = model
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if obj is not None and len(obj) > 0:
+            return obj[0], ".".join(path) + "[0]"
+    # Last resort: class-name filter.
+    hits = [(n, m) for n, m in model.named_modules()
+            if m.__class__.__name__.endswith("DecoderLayer")]
+    assert hits, "could not locate any decoder layer to hook"
+    return hits[0][1], hits[0][0]
+
+
+first_layer, _hook_site = first_decoder_layer(model)
+assert len(first_layer.state_dict()) > 0, "resolved an empty module as block 1"
+print(f"Ablation hook site: {_hook_site}  ({first_layer.__class__.__name__})")
+
+
+# The hook sees only hidden states, not input_ids, so the current sequence's
+# vision mask is handed to it through this module-level slot. measure_cosine_per_layer
+# sets it immediately before every forward pass.
+CURRENT_VISION_MASK = None
 
 
 def ablate_embed_pre_hook(module, args, kwargs):
+    """Project v_hat out of the VISION token embeddings only.
+
+    The text embeddings (caption, prompt, and all structural/sink tokens) are
+    left untouched: we are removing the modality direction from the image side
+    and asking whether the model still separates the two streams, not rewriting
+    both sides of the comparison at once."""
     h = args[0]                                             # hidden_states[0]: [B, seq, d]
+    mask = CURRENT_VISION_MASK
+    assert mask is not None, "CURRENT_VISION_MASK not set before the forward pass"
+    assert mask.shape[0] == h.shape[1], (
+        f"vision mask covers {mask.shape[0]} positions but the sequence is {h.shape[1]}")
+
     coord = torch.matmul(h.float(), vhat)                  # (h . v_hat): [B, seq]
-    h = h - (coord.unsqueeze(-1) * vhat).to(h.dtype)       # h - (h.v_hat) v_hat
-    return (h, *args[1:]), kwargs
+    delta = (coord.unsqueeze(-1) * vhat).to(h.dtype)       # (h.v_hat) v_hat
+    delta = delta * mask.to(h.dtype).view(1, -1, 1)        # zero the edit at text positions
+    return (h - delta, *args[1:]), kwargs
 
 
 handle = first_layer.register_forward_pre_hook(ablate_embed_pre_hook, with_kwargs=True)
@@ -255,10 +350,10 @@ fig, ax = plt.subplots(figsize=(9, 5))
 ax.plot(layers, baseline_cosines, "-o", color="#4C72B0", label="Baseline (unmodified)")
 ax.plot(layers, ablated_cosines, "-o", color="#C44E52",
         label="Ablated (candidate vector removed at layer 0)")
-# Control: same baseline activations, correspondence broken. Gap to the blue
-# curve = however much of the similarity is semantic alignment.
-ax.plot(layers, baseline_res["cross"], ":", color="#7F7F7F", linewidth=2,
-        label="Baseline, cross-paired control (image vs. other pair's text)")
+# The cross-paired control (image vs. another pair's text) is still computed and
+# saved to the JSON as "cross", but it is deliberately NOT plotted here — this
+# figure is the plain baseline-vs-ablated comparison. The mismatched-pairs
+# experiment is where that control belongs.
 ax.set_xlabel("Layer")
 ax.set_ylabel("cosine(mean vision, mean text)")
 ax.set_xticks(range(0, N_LAYERS + 1, 2))
@@ -269,7 +364,7 @@ ax.spines["right"].set_visible(False)
 ax.legend()
 plt.title(
     "Vision-text representational similarity across layers\n"
-    f"Qwen2-VL-2B, {N_PAIRS} pairs each, mean of per-pair cosines"
+    f"{MODEL_ID.split('/')[-1]}, {N_PAIRS} pairs each, mean of per-pair cosines"
 )
 fig.tight_layout()
 out = os.path.join(HERE, "cosine_comparison.png")
