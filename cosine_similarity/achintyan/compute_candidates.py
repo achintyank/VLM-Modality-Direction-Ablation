@@ -46,7 +46,7 @@ print(f"Model loaded on {device}.")
 # ---------------------------------------------------------------------------
 # Step 2: build the embedding-level candidate vector from 40 pairs
 # ---------------------------------------------------------------------------
-N_PAIRS = 40
+N_PAIRS = 500
 MAX_VISION_TOKENS = 1000       # skip huge images (memory + time)
 MIN_VISION_TOKENS = 4          # skip degenerate 1x1 images
 PROMPT_TEXT = "What is in the image?"
