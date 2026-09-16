@@ -1,16 +1,24 @@
 """
 compute_candidates.py — build the embedding-level candidate (modality) vector for
+
+Model notes (from the published config):
+  - text_config.num_hidden_layers = 35, while vision_config is 16 and audio_config
+    is 12. The layer count is read TEXT-CONFIG-FIRST for that reason — picking up
+    a tower's depth here would silently measure the wrong range.
+  - text_config.hidden_size = 1536, which is the SAME as Qwen2-VL-2B. The
+    dimension assert on the candidate vector therefore cannot catch a 2B vector
+    dropped into this folder; the model_id assert is what protects you. Do not
+    reuse a candidate_vector.pt across those two models.
+  - image_token_id = 258880, at the top level of the config.
+  - Gemma-4 is also an audio model. Only image + text are exercised here; "text"
+    still means every non-image token.
+
 the cosine-similarity experiment.
 
-For each pair, at EVERY layer (hidden_states[0..N_LAYERS]), computes
-    mean(text acts) - mean(vision acts)
--> one vector per pair per layer; then averages across pairs into ONE candidate
-direction PER LAYER. Layer 0 is the input embeddings (before block 1); layers
-1..N are the outputs of each decoder block.
-
-The saved file also keeps the old single-vector keys ("candidate", "level",
-"d_model") holding the layer-0 direction, so cosine_experiment.py — which ablates
-at hidden_states[0] only — runs against this file unchanged.
+Runs 40 unique PixelProse image+caption pairs. For each pair, at hidden_states[0]
+(the input embeddings, BEFORE block 1), computes
+    mean(text embeddings) - mean(vision embeddings)
+-> one candidate vector per pair; then averages the 40 into a single direction.
 Saved for the next script (the cosine-sim experiment), which projects this vector
 out of hidden_states[0] during its ablated run.
 
@@ -20,8 +28,9 @@ Notes:
   - the vector lives at the EMBEDDING level (hidden_states[0]) because that is the
     exact space where the ablation is applied.
 
-Model: Qwen2-VL-7B-Instruct, d_model = 3584 (the 2B is 1536). The vector this
-writes is only valid for the model named in MODEL_ID below — the cosine
+Model: google/gemma-4-E2B. d_model and the layer count are read from the
+config rather than assumed. The
+vector written is valid ONLY for the model named in MODEL_ID below; the cosine
 experiment asserts on both the model id and the dimension before it runs.
 
 Output: candidate_vector.pt  {candidate: [d_model], level: "hidden_states[0]", ...}
@@ -35,18 +44,33 @@ import requests
 import torch
 from huggingface_hub import hf_hub_download
 from PIL import Image
-from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
 # ---------------------------------------------------------------------------
-# Step 1: load Qwen2-VL-7B
+# Step 1: load Gemma-4 E2B
 # ---------------------------------------------------------------------------
-MODEL_ID = "Qwen/Qwen2-VL-7B-Instruct"
+MODEL_ID = "google/gemma-4-E2B"
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16
 
-model = Qwen2VLForConditionalGeneration.from_pretrained(MODEL_ID, torch_dtype=dtype).to(device)
+# Gemma-4 registers as Gemma4ForConditionalGeneration. AutoModelForImageTextToText
+# should resolve it from the config; if this transformers build does not have
+# gemma4 mapped into that Auto class yet, fall back to the concrete class by name
+# rather than failing with an unhelpful KeyError.
+try:
+    model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, torch_dtype=dtype).to(device)
+except (KeyError, ValueError) as e:
+    import transformers
+    _cls = getattr(transformers, "Gemma4ForConditionalGeneration", None)
+    if _cls is None:
+        raise RuntimeError(
+            f"transformers {transformers.__version__} cannot load {MODEL_ID} "
+            f"(no gemma4 mapping and no Gemma4ForConditionalGeneration). Upgrade it."
+        ) from e
+    print(f"AutoModelForImageTextToText failed ({e}); using Gemma4ForConditionalGeneration.")
+    model = _cls.from_pretrained(MODEL_ID, torch_dtype=dtype).to(device)
 model.eval()
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 print(f"Model loaded on {device}.")
@@ -66,9 +90,20 @@ SHARD = "data/vlm_captions_cc12m_03.parquet"
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_PATH = os.path.join(HERE, "candidate_vector.pt")
 
+# Gemma-4 puts image_token_id at the TOP level of the config (258880); it has no
+# image_token_index, and its image placeholder is not Qwen's <|image_pad|>. Read
+# the config first and only guess at a token string as a last resort.
 image_token_id = getattr(model.config, "image_token_id", None)
 if image_token_id is None:
-    image_token_id = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    image_token_id = getattr(model.config, "image_token_index", None)
+if image_token_id is None:
+    for _tok in ("<image_soft_token>", "<image>", "<start_of_image>"):
+        _id = processor.tokenizer.convert_tokens_to_ids(_tok)
+        if _id is not None and _id != processor.tokenizer.unk_token_id:
+            image_token_id = _id
+            break
+assert image_token_id is not None, "could not resolve the image token id"
+print(f"image_token_id = {image_token_id}")
 
 _local = hf_hub_download("tomg-group-umd/pixelprose", SHARD, repo_type="dataset")
 df = pd.read_parquet(_local, columns=["url", "vlm_caption"])
@@ -96,18 +131,8 @@ def build_inputs(image, caption):
     return processor(text=[chat_text], images=[image], return_tensors="pt").to(device)
 
 
-# For each pair, at EVERY layer L in hidden_states[0..N_LAYERS]:
-#   mean(text acts at L) - mean(vision acts at L)
-# Layer 0 is the input embeddings (what the old single-vector build used); layers
-# 1..N are the outputs of each decoder block. Accumulate a running sum per layer
-# rather than keeping every pair's vector: 500 pairs x 29 layers x 3584 floats
-# would be ~200 MB of tensors held for no reason.
-_text_config = model.config.get_text_config()
-N_LAYERS = getattr(_text_config, "num_hidden_layers", None) or model.config.num_hidden_layers
-LAYERS = list(range(N_LAYERS + 1))                     # 0..N inclusive
-print(f"{MODEL_ID.split('/')[-1]}: building candidates for layers 0..{N_LAYERS}")
-
-sums = {L: None for L in LAYERS}
+# For each pair: mean(text embeddings) - mean(vision embeddings) at hidden_states[0].
+pair_vectors = []
 n_used = 0
 for sample in df.itertuples(index=False):
     if n_used >= N_PAIRS:
@@ -131,36 +156,25 @@ for sample in df.itertuples(index=False):
     with torch.no_grad():
         out = model(**inputs, output_hidden_states=True)
 
-    for L in LAYERS:
-        h = out.hidden_states[L][0].float()        # [seq, d_model] at this layer
-        v = (h[text_mask].mean(dim=0) - h[vision_mask].mean(dim=0)).cpu()   # text - vision
-        sums[L] = v if sums[L] is None else sums[L] + v
+    emb = out.hidden_states[0][0].float()         # [seq, d_model] = input embeddings
+    vis_mean = emb[vision_mask].mean(dim=0)       # [d_model]
+    txt_mean = emb[text_mask].mean(dim=0)         # [d_model]
+    pair_vectors.append((txt_mean - vis_mean).cpu())   # text - vision, this pair
 
     del out
     n_used += 1
 
-assert n_used == N_PAIRS, f"only used {n_used}/{N_PAIRS} pairs"
+# Average the per-pair (text - vision) vectors -> the candidate direction.
+candidate = torch.stack(pair_vectors).mean(dim=0)      # [d_model]
+print(f"\nBuilt candidate vector from {n_used} pairs. "
+      f"norm = {torch.linalg.vector_norm(candidate):.3f}")
 
-# Mean over pairs -> one candidate direction per layer.
-candidates = {L: sums[L] / n_used for L in LAYERS}
-print(f"\nBuilt {len(candidates)} candidate vectors from {n_used} pairs.")
-for L in LAYERS:
-    print(f"  layer {L:2d}: norm = {torch.linalg.vector_norm(candidates[L]):.3f}")
-
-d_model = int(candidates[0].shape[0])
 torch.save({
-    # New: one vector per layer, keyed 0..N_LAYERS (0 = input embeddings).
-    "candidates": candidates,
-    "layers": LAYERS,
-    "n_layers": N_LAYERS,
-    # Back-compat: cosine_experiment.py ablates at hidden_states[0] and reads these
-    # three keys. Keeping them means the existing experiment runs unchanged against
-    # this file — layer 0 here is bit-for-bit the vector the old script produced.
-    "candidate": candidates[0],
+    "candidate": candidate,
     "level": "hidden_states[0]",
     "model_id": MODEL_ID,
     "n_pairs": n_used,
     "shard": SHARD,
-    "d_model": d_model,
+    "d_model": int(candidate.shape[0]),
 }, OUT_PATH)
-print(f"saved {OUT_PATH}  ({len(candidates)} layers, d_model={d_model})")
+print(f"saved {OUT_PATH}")

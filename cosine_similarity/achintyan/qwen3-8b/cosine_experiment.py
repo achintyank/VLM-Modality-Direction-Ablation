@@ -5,15 +5,17 @@ Per layer (hidden_states[1..N]), measure how similar the AVERAGE vision-token
 representation is to the AVERAGE text-token representation (cosine), for:
   - a BASELINE run (unmodified), and
   - an ABLATED run: the candidate vector (from compute_candidates.py) projected
-    out of the VISION token embeddings in hidden_states[0] ONLY, before block 1,
-    propagating onward. Text/caption embeddings are NOT modified.
+    out of ALL token embeddings (vision and text) in hidden_states[0] ONLY,
+    before block 1, propagating onward.
 Then plot both cosine curves across layers to see if/where the modality gap closes
 and how the input-ablation changes that trajectory.
 
   - text = ALL non-vision tokens (input_ids != image_token_id).
-  - cosine per layer = mean over pairs of cos(that pair's mean vision vector,
-    that pair's OWN mean text vector). One cosine per pair, THEN averaged, so the
-    image/caption correspondence survives the aggregation.
+  - cosine per layer = mean over pairs of cos(vision_i - mu_L, text_i - mu_L),
+    where mu_L is the corpus mean over every token at that layer. One cosine per
+    pair, THEN averaged, so the image/caption correspondence survives; centered,
+    so the number is not dominated by the shared offset all activations carry.
+    The uncentered "paired" curve is still computed and saved alongside it.
     (The earlier metric — collapse to one mean vector per modality, then a single
     cosine — averaged the pairing away before comparing and was therefore nearly
     blind to semantic alignment. It is still computed and saved as "grandmean"
@@ -166,7 +168,21 @@ def measure_cosine_per_layer(pairs):
     cosine between the vision and text representations. Returns a dict of three
     per-layer curves (each a list of N_LAYERS floats, layers 1..N_LAYERS):
 
-      "paired"    mean_i cos(vision_i, text_i)  <- PRIMARY.
+      "paired_centered"  mean_i cos(vision_i - mu_L, text_i - mu_L)  <- PRIMARY.
+                  mu_L = the mean over EVERY token at layer L across all pairs
+                  (the corpus mean). Cosine measures angle from the ORIGIN, but
+                  activations sit in a tight cone far from it, so an uncentered
+                  cosine is dominated by that shared offset rather than by any
+                  vision/text relationship. Subtracting mu_L asks the real
+                  question: does THIS pair's image deviate from the corpus
+                  baseline in the same direction as ITS caption?
+                  Only valid per-pair. Centering the GRAND means is degenerate:
+                  mu_L is a weighted average of the two modality means, so it
+                  lies on the segment between them and the two centered grand
+                  means come out exactly antiparallel (cos = -1) for ANY data.
+                  Hence there is deliberately no "grandmean_centered".
+
+      "paired"    mean_i cos(vision_i, text_i)  <- uncentered.
                   One cosine per pair, then averaged. Each cosine compares a
                   pair's own image against its own text, so the image/caption
                   correspondence SURVIVES the aggregation.
@@ -189,6 +205,8 @@ def measure_cosine_per_layer(pairs):
     layers = range(1, N_LAYERS + 1)            # 1..N  (skip the embedding, layer 0)
     vis_means = {L: [] for L in layers}        # per layer: list of per-pair vision means
     txt_means = {L: [] for L in layers}
+    tok_sums = {L: None for L in layers}       # per layer: running sum over ALL tokens
+    tok_count = 0                              # total tokens seen (same for every layer)
 
     for i, (image, caption) in enumerate(pairs):
         inputs = build_inputs(image, caption)
@@ -196,36 +214,47 @@ def measure_cosine_per_layer(pairs):
         vision_mask = ids == image_token_id
         text_mask = ~vision_mask               # ALL non-vision tokens = text
         print(f"  [{i + 1}/{len(pairs)}] forward ...", flush=True)
-        # Publish this sequence's vision mask for the ablation hook. Harmless on an
-        # unablated run (no hook is registered), required on an ablated one.
-        global CURRENT_VISION_MASK
-        CURRENT_VISION_MASK = vision_mask.to(device)
         with torch.no_grad():
             out = model(**inputs, output_hidden_states=True)
         for L in layers:
             h = out.hidden_states[L][0].float()              # [seq, d_model]
             vis_means[L].append(h[vision_mask].mean(dim=0))  # this pair's mean vision vector
             txt_means[L].append(h[text_mask].mean(dim=0))    # this pair's mean text vector
+            col = h.sum(dim=0)                               # accumulate for the corpus mean
+            tok_sums[L] = col if tok_sums[L] is None else tok_sums[L] + col
+        tok_count += int(ids.shape[0])
         del out
 
     cos = torch.nn.functional.cosine_similarity
     paired, cross, grandmean = [], [], []
+    paired_centered, cross_centered = [], []
     for L in layers:
         V = torch.stack(vis_means[L])                      # [n_pairs, d_model]
         T = torch.stack(txt_means[L])                      # [n_pairs, d_model]
-        paired.append(cos(V, T, dim=1).mean().item())      # row i vs row i
         T_shift = torch.roll(T, shifts=-1, dims=0)         # row i vs row i+1
+        mu = tok_sums[L] / tok_count                       # corpus mean [d_model]
+
+        paired.append(cos(V, T, dim=1).mean().item())      # row i vs row i
         cross.append(cos(V, T_shift, dim=1).mean().item())
         grandmean.append(cos(V.mean(dim=0), T.mean(dim=0), dim=0).item())
-    return {"paired": paired, "cross": cross, "grandmean": grandmean}
+
+        # CENTERED (headline) + its matching control. Both must be centered, or
+        # the paired-minus-cross difference compares two different spaces.
+        paired_centered.append(cos(V - mu, T - mu, dim=1).mean().item())
+        cross_centered.append(cos(V - mu, T_shift - mu, dim=1).mean().item())
+
+    return {"paired_centered": paired_centered, "cross_centered": cross_centered,
+            "paired": paired, "cross": cross, "grandmean": grandmean}
 
 
 baseline_res = measure_cosine_per_layer(baseline_pairs)
-baseline_cosines = baseline_res["paired"]
-print("\nBaseline cosine(vision, text) per layer   [paired | cross | grandmean]:")
+baseline_cosines = baseline_res["paired_centered"]   # headline metric
+print("\nBaseline cosine(vision, text) per layer   [centered | cross_c | gap | paired | grandmean]:")
 for i, L in enumerate(range(1, N_LAYERS + 1)):
-    print(f"  layer {L:2d}: {baseline_res['paired'][i]:+.4f} | "
-          f"{baseline_res['cross'][i]:+.4f} | {baseline_res['grandmean'][i]:+.4f}")
+    _gap = baseline_res['paired_centered'][i] - baseline_res['cross_centered'][i]
+    print(f"  layer {L:2d}: {baseline_res['paired_centered'][i]:+.4f} | "
+          f"{baseline_res['cross_centered'][i]:+.4f} | gap {_gap:+.4f} | "
+          f"{baseline_res['paired'][i]:+.4f} | {baseline_res['grandmean'][i]:+.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -244,9 +273,9 @@ print(f"\nPulled {len(ablated_pairs)} ablated pairs.")
 
 
 # Forward-PRE-hook on the FIRST decoder layer: its input is hidden_states[0] (the
-# embeddings, before block 1). Project v_hat out of the VISION tokens there ONLY;
-# it then propagates through every following block. Text embeddings are left
-# untouched, and no other layer is touched.
+# embeddings, before block 1). Project v_hat out of EVERY token there — vision
+# and text alike; it then propagates through every following block. No other
+# layer is touched.
 def first_decoder_layer(model):
     """Block 1 of the LANGUAGE model. Walk the known attribute paths first: a
     class-name filter over named_modules() is fragile across architectures, since
@@ -275,29 +304,16 @@ assert len(first_layer.state_dict()) > 0, "resolved an empty module as block 1"
 print(f"Ablation hook site: {_hook_site}  ({first_layer.__class__.__name__})")
 
 
-# The hook sees only hidden states, not input_ids, so the current sequence's
-# vision mask is handed to it through this module-level slot. measure_cosine_per_layer
-# sets it immediately before every forward pass.
-CURRENT_VISION_MASK = None
-
-
 def ablate_embed_pre_hook(module, args, kwargs):
-    """Project v_hat out of the VISION token embeddings only.
+    """Project v_hat out of EVERY token embedding — vision and text alike.
 
-    The text embeddings (caption, prompt, and all structural/sink tokens) are
-    left untouched: we are removing the modality direction from the image side
-    and asking whether the model still separates the two streams, not rewriting
-    both sides of the comparison at once."""
+    Two-sided by design: it puts both modalities on the same hyperplane
+    (h . v_hat == 0), so the gap along this axis is removed symmetrically rather
+    than one side being moved relative to the other."""
     h = args[0]                                             # hidden_states[0]: [B, seq, d]
-    mask = CURRENT_VISION_MASK
-    assert mask is not None, "CURRENT_VISION_MASK not set before the forward pass"
-    assert mask.shape[0] == h.shape[1], (
-        f"vision mask covers {mask.shape[0]} positions but the sequence is {h.shape[1]}")
-
     coord = torch.matmul(h.float(), vhat)                  # (h . v_hat): [B, seq]
-    delta = (coord.unsqueeze(-1) * vhat).to(h.dtype)       # (h.v_hat) v_hat
-    delta = delta * mask.to(h.dtype).view(1, -1, 1)        # zero the edit at text positions
-    return (h - delta, *args[1:]), kwargs
+    h = h - (coord.unsqueeze(-1) * vhat).to(h.dtype)       # h - (h.v_hat) v_hat
+    return (h, *args[1:]), kwargs
 
 
 handle = first_layer.register_forward_pre_hook(ablate_embed_pre_hook, with_kwargs=True)
@@ -306,11 +322,13 @@ try:
 finally:
     handle.remove()   # ablation OFF after measuring
 
-ablated_cosines = ablated_res["paired"]
-print("\nAblated cosine(vision, text) per layer   [paired | cross | grandmean]:")
+ablated_cosines = ablated_res["paired_centered"]     # headline metric
+print("\nAblated cosine(vision, text) per layer   [centered | cross_c | gap | paired | grandmean]:")
 for i, L in enumerate(range(1, N_LAYERS + 1)):
-    print(f"  layer {L:2d}: {ablated_res['paired'][i]:+.4f} | "
-          f"{ablated_res['cross'][i]:+.4f} | {ablated_res['grandmean'][i]:+.4f}")
+    _gap = ablated_res['paired_centered'][i] - ablated_res['cross_centered'][i]
+    print(f"  layer {L:2d}: {ablated_res['paired_centered'][i]:+.4f} | "
+          f"{ablated_res['cross_centered'][i]:+.4f} | gap {_gap:+.4f} | "
+          f"{ablated_res['paired'][i]:+.4f} | {ablated_res['grandmean'][i]:+.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +343,7 @@ layers = list(range(1, N_LAYERS + 1))
 
 with open(os.path.join(HERE, "cosine_results.json"), "w") as f:
     json.dump({"model_id": MODEL_ID, "n_pairs": N_PAIRS, "layers": layers,
-               "metric": "paired = mean over pairs of cos(vision_i, text_i)",
+               "metric": "paired_centered = mean over pairs of cos(vision_i - mu_L, text_i - mu_L); cross_centered/paired/cross/grandmean also saved",
                "baseline": baseline_res, "ablated": ablated_res}, f, indent=2)
 
 fig, ax = plt.subplots(figsize=(9, 5))
@@ -337,7 +355,7 @@ ax.plot(layers, ablated_cosines, "-o", color="#C44E52",
 # figure is the plain baseline-vs-ablated comparison. The mismatched-pairs
 # experiment is where that control belongs.
 ax.set_xlabel("Layer")
-ax.set_ylabel("cosine(mean vision, mean text)")
+ax.set_ylabel("centered cosine(vision, text)")
 ax.set_xticks(range(0, N_LAYERS + 1, 2))
 ax.set_xlim(min(layers) - 0.5, max(layers) + 0.5)
 ax.grid(alpha=0.3)
@@ -346,9 +364,10 @@ ax.spines["right"].set_visible(False)
 ax.legend()
 plt.title(
     "Vision-text representational similarity across layers\n"
-    f"{MODEL_ID.split('/')[-1]}, {N_PAIRS} pairs each, mean of per-pair cosines"
+    f"{MODEL_ID.split('/')[-1]}, {N_PAIRS} pairs each, centered per-pair cosines"
 )
 fig.tight_layout()
-out = os.path.join(HERE, "cosine_comparison.png")
-fig.savefig(out, dpi=150)
+out = os.path.join(HERE, "cosine_comparison.pdf")
+plt.rcParams["pdf.fonttype"] = 42        # embed TrueType: text stays selectable
+fig.savefig(out, format="pdf", bbox_inches="tight")
 print(f"\nsaved {out}")

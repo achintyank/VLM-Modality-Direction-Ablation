@@ -1,37 +1,52 @@
 """
 mismatched_cosine_experiment.py — the cosine-similarity modality-gap experiment
-(PaliGemma2-3B pt-224) re-run on MISMATCHED image/caption pairs.
+(Gemma-4 E2B) re-run on MISMATCHED image/caption pairs.
 
 Why
 ---
 The matched experiment pairs each image with its OWN PixelProse caption, which
 confounds modality (vision vs. text) with semantic content (the caption
 describes the image). This run breaks the semantic link and changes nothing
-else: same model, same shards, same seeds, same metric, same two-sided
-layer-0 ablation, same candidate vector. Only the PAIRING is deranged.
+else: same model, same shard, same seed, same metric, same two-sided layer-0
+ablation, same candidate vector. Only the PAIRING is deranged.
 
-Read it against the matched run in cosine_similarity/achintyan/palig2-3b:
+Read it against the matched run in cosine_similarity/achintyan/gemma4-e2b:
   - the two track each other  -> the trajectory does not depend on the caption
     describing the image, so it is not semantic binding.
   - they diverge              -> semantic alignment is doing real work.
 
-ONE run only: deranged pairs, vision-embedding ablation, record the per-layer
-cosines. There is no unablated arm here — the comparison curve is the ablated
-arm of the matched experiment, which used this same shard and seed.
+ONE run only: deranged pairs, layer-0 ablation, record the per-layer cosines.
+There is no unablated arm here — the comparison curve is the ablated arm of the
+matched experiment, which used this same shard and seed.
 
-Method (identical to the matched run)
+Model notes (from the published config):
+  - text_config.num_hidden_layers = 35, while vision_config is 16 and audio_config
+    is 12. The layer count is read TEXT-CONFIG-FIRST for that reason — picking up
+    a tower's depth here would silently measure the wrong range.
+  - text_config.hidden_size = 1536, which is the SAME as Qwen2-VL-2B. The
+    dimension assert on the candidate vector therefore cannot catch a 2B vector
+    dropped into this folder; the model_id assert is what protects you. Do not
+    reuse a candidate_vector.pt across those two models.
+  - image_token_id = 258880, at the top level of the config.
+  - Gemma-4 is also an audio model. Only image + text are exercised here; "text"
+    still means every non-image token.
+
+
+Per layer (hidden_states[1..N]), measure how similar the AVERAGE vision-token
+representation is to the AVERAGE text-token representation (cosine), for:
+  - a BASELINE run (unmodified), and
+  - an ABLATED run: the candidate vector (from compute_candidates.py) projected
+    out of ALL token embeddings (vision and text) in hidden_states[0] ONLY,
+    before block 1, propagating onward.
+Then plot both cosine curves across layers to see if/where the modality gap closes
+and how the input-ablation changes that trajectory.
+
   - text = ALL non-vision tokens (input_ids != image_token_id).
-  - ARCHITECTURE CAVEAT: PaliGemma attends BIDIRECTIONALLY over the prefix
-    (image + prompt) and causally only over the suffix, whereas Qwen2-VL is
-    causal throughout. Vision tokens here can therefore see the caption
-    tokens directly. Curves are comparable to the Qwen ones in shape, but a
-    difference between models may come from this masking, not from scale.
   - cosine per layer = mean over pairs of cos(vision_i - mu_L, text_i - mu_L),
-    centered on the corpus mean mu_L at that layer, where text_i is the caption
-    that pair was DERANGED onto. Centering matters: uncentered, matched and
-    mismatched pairs differ by ~0.03; centered the gap is ~0.12 and grows with
-    depth, so the uncentered metric could barely see this experiment's effect. One cosine per pair, THEN averaged, so the
-    image/caption correspondence survives the aggregation.
+    where mu_L is the corpus mean over every token at that layer. One cosine per
+    pair, THEN averaged, so the image/caption correspondence survives; centered,
+    so the number is not dominated by the shared offset all activations carry.
+    The uncentered "paired" curve is still computed and saved alongside it.
     (The earlier metric — collapse to one mean vector per modality, then a single
     cosine — averaged the pairing away before comparing and was therefore nearly
     blind to semantic alignment. It is still computed and saved as "grandmean"
@@ -46,8 +61,6 @@ Method (identical to the matched run)
 
 Built step by step. Steps 1-3 done (baseline + ablated cosines); step 4 = plot.
   - pairs are DERANGED after they are pulled (see derange() below).
-  - ablation removes the candidate direction from ALL token embeddings, vision
-    and text alike (two-sided, symmetric).
 """
 
 import io
@@ -62,28 +75,46 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
 # ---------------------------------------------------------------------------
-# Load PaliGemma2-3B pt-224 (same model the candidate vector must be built on)
+# Load Gemma-4 E2B (same model the candidate vector must be built on)
 # ---------------------------------------------------------------------------
-MODEL_ID = "google/paligemma2-3b-pt-224"
+MODEL_ID = "google/gemma-4-E2B"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16
 
-# PaliGemma2 is a gated repo on the Hub — `huggingface-cli login` first, or the
-# from_pretrained below 401s. AutoModelForImageTextToText resolves the right class
-# from the config rather than hardcoding one.
-model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, torch_dtype=dtype).to(device)
+# Gemma-4 registers as Gemma4ForConditionalGeneration. AutoModelForImageTextToText
+# should resolve it from the config; if this transformers build does not have
+# gemma4 mapped into that Auto class yet, fall back to the concrete class by name
+# rather than failing with an unhelpful KeyError.
+try:
+    model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, torch_dtype=dtype).to(device)
+except (KeyError, ValueError) as e:
+    import transformers
+    _cls = getattr(transformers, "Gemma4ForConditionalGeneration", None)
+    if _cls is None:
+        raise RuntimeError(
+            f"transformers {transformers.__version__} cannot load {MODEL_ID} "
+            f"(no gemma4 mapping and no Gemma4ForConditionalGeneration). Upgrade it."
+        ) from e
+    print(f"AutoModelForImageTextToText failed ({e}); using Gemma4ForConditionalGeneration.")
+    model = _cls.from_pretrained(MODEL_ID, torch_dtype=dtype).to(device)
 model.eval()
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 print(f"Model loaded on {device}.")
 
-# PaliGemma names this image_token_index, Qwen names it image_token_id — check
-# both, then fall back to looking up the <image> token in the tokenizer.
-image_token_id = getattr(model.config, "image_token_index", None)
+# Gemma-4 puts image_token_id at the TOP level of the config (258880); it has no
+# image_token_index, and its image placeholder is not Qwen's <|image_pad|>. Read
+# the config first and only guess at a token string as a last resort.
+image_token_id = getattr(model.config, "image_token_id", None)
 if image_token_id is None:
-    image_token_id = getattr(model.config, "image_token_id", None)
+    image_token_id = getattr(model.config, "image_token_index", None)
 if image_token_id is None:
-    image_token_id = processor.tokenizer.convert_tokens_to_ids("<image>")
+    for _tok in ("<image_soft_token>", "<image>", "<start_of_image>"):
+        _id = processor.tokenizer.convert_tokens_to_ids(_tok)
+        if _id is not None and _id != processor.tokenizer.unk_token_id:
+            image_token_id = _id
+            break
 assert image_token_id is not None, "could not resolve the image token id"
+print(f"image_token_id = {image_token_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -119,11 +150,6 @@ print(f"Loaded candidate vector ({_cand_blob['level']}, d={_cand.shape[0]}) buil
 # Step 1: pull 500 random image+caption pairs (local shard)
 # ---------------------------------------------------------------------------
 N_PAIRS = 500
-# pt-224 encodes EVERY image to exactly 256 tokens (a fixed 224x224 / 14px grid,
-# unlike Qwen2-VL's variable count), so these bounds never actually reject an
-# image here. They are kept as a tripwire: if n_vis is ever not 256, the
-# processor is not doing what this script assumes.
-EXPECTED_VISION_TOKENS = 256
 MAX_VISION_TOKENS = 1000
 MIN_VISION_TOKENS = 4
 PROMPT_TEXT = "What is in the image?"
@@ -147,14 +173,14 @@ def fetch_image(url, timeout=10):
 
 
 def build_inputs(image, caption):
-    """image + caption + question, PaliGemma style.
-
-    NOT the Qwen path: paligemma2-3b-pt-224 is a PRETRAINED checkpoint with no
-    chat template, so apply_chat_template does not apply. The processor takes the
-    raw prompt string and the image directly — it prepends the 256 <image>
-    tokens, then BOS, the prompt, and a trailing newline."""
+    """image + caption + question via the Qwen2-VL chat template."""
     text = f"{caption}\n{PROMPT_TEXT}"
-    return processor(text=text, images=image, return_tensors="pt").to(device)
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": image},
+        {"type": "text", "text": text},
+    ]}]
+    chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return processor(text=[chat_text], images=[image], return_tensors="pt").to(device)
 
 
 def pull_pairs(df, n):
@@ -172,12 +198,17 @@ def pull_pairs(df, n):
             continue
         inputs = build_inputs(image, caption)
         n_vis = int((inputs["input_ids"][0] == image_token_id).sum())
-        assert n_vis == EXPECTED_VISION_TOKENS, (
-            f"expected {EXPECTED_VISION_TOKENS} vision tokens from {MODEL_ID}, got {n_vis}")
         if n_vis < MIN_VISION_TOKENS or n_vis >= MAX_VISION_TOKENS:
             continue
         pairs.append((image, caption))
         print(f"  pulled {len(pairs)}/{n} (n_vis={n_vis})", flush=True)
+    # An empty haul almost always means the chat template did not expand the image
+    # placeholder, so every n_vis was 0 and every row was skipped — a silent failure
+    # that would otherwise surface as a nan cosine much later.
+    assert len(pairs) == n, (
+        f"only collected {len(pairs)}/{n} pairs. If n_vis was 0 throughout, the "
+        f"processor is not inserting image_token_id={image_token_id} — check the "
+        f"chat-template path in build_inputs against this model's expected format.")
     return pairs
 
 
@@ -358,7 +389,7 @@ finally:
     handle.remove()   # ablation OFF after measuring
 
 ablated_cosines = ablated_res["paired_centered"]     # headline metric
-print("\nMismatched + vision-ablated cosine per layer   [centered | cross_c | gap | paired | grandmean]:")
+print("\nMismatched + ablated cosine per layer   [centered | cross_c | gap | paired | grandmean]:")
 for i, L in enumerate(range(1, N_LAYERS + 1)):
     _gap = ablated_res['paired_centered'][i] - ablated_res['cross_centered'][i]
     print(f"  layer {L:2d}: {ablated_res['paired_centered'][i]:+.4f} | "

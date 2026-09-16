@@ -7,7 +7,7 @@ Why
 The matched experiment pairs each image with its OWN PixelProse caption, which
 confounds modality (vision vs. text) with semantic content (the caption
 describes the image). This run breaks the semantic link and changes nothing
-else: same model, same shards, same seeds, same metric, same vision-only
+else: same model, same shards, same seeds, same metric, same two-sided
 layer-0 ablation, same candidate vector. Only the PAIRING is deranged.
 
 Read it against the matched run in cosine_similarity/achintyan/qwen3-8b:
@@ -15,14 +15,17 @@ Read it against the matched run in cosine_similarity/achintyan/qwen3-8b:
     describing the image, so it is not semantic binding.
   - they diverge              -> semantic alignment is doing real work.
 
-Structure mirrors cosine_experiment.py exactly — BOTH arms are run here
-(baseline and ablated, each on its own disjoint shard), so this folder is
-self-contained and needs no cross-folder comparison file.
+ONE run only: deranged pairs, vision-embedding ablation, record the per-layer
+cosines. There is no unablated arm here — the comparison curve is the ablated
+arm of the matched experiment, which used this same shard and seed.
 
 Method (identical to the matched run)
   - text = ALL non-vision tokens (input_ids != image_token_id).
-  - cosine per layer = mean over pairs of cos(that pair's mean vision vector,
-    the mean text vector of the caption it was DERANGED onto). One cosine per pair, THEN averaged, so the
+  - cosine per layer = mean over pairs of cos(vision_i - mu_L, text_i - mu_L),
+    centered on the corpus mean mu_L at that layer, where text_i is the caption
+    that pair was DERANGED onto. Centering matters: uncentered, matched and
+    mismatched pairs differ by ~0.03; centered the gap is ~0.12 and grows with
+    depth, so the uncentered metric could barely see this experiment's effect. One cosine per pair, THEN averaged, so the
     image/caption correspondence survives the aggregation.
     (The earlier metric — collapse to one mean vector per modality, then a single
     cosine — averaged the pairing away before comparing and was therefore nearly
@@ -38,6 +41,8 @@ Method (identical to the matched run)
 
 Built step by step. Steps 1-3 done (baseline + ablated cosines); step 4 = plot.
   - pairs are DERANGED after they are pulled (see derange() below).
+  - ablation removes the candidate direction from ALL token embeddings, vision
+    and text alike (two-sided, symmetric).
 """
 
 import io
@@ -100,19 +105,20 @@ print(f"Loaded candidate vector ({_cand_blob['level']}, d={_cand.shape[0]}) buil
 
 
 # ---------------------------------------------------------------------------
-# Step 1: pull 500 random BASELINE image+caption pairs (local shard)
+# Step 1: pull 500 random image+caption pairs (local shard)
 # ---------------------------------------------------------------------------
 N_PAIRS = 500
 MAX_VISION_TOKENS = 1000
 MIN_VISION_TOKENS = 4
 PROMPT_TEXT = "What is in the image?"
-# Baseline shard — distinct from the candidate set (cc12m_03) and the ablated set.
-BASELINE_SHARD = "data/vlm_captions_cc12m_01.parquet"
+# Same shard/seed the matched experiment used for its ablated arm, so this run
+# differs from it in exactly one way: the pairing is deranged.
+SHARD = "data/vlm_captions_cc12m_02.parquet"
 
-_local = hf_hub_download("tomg-group-umd/pixelprose", BASELINE_SHARD, repo_type="dataset")
-baseline_df = pd.read_parquet(_local, columns=["url", "vlm_caption"])
-baseline_df = baseline_df.sample(frac=1.0, random_state=1).reset_index(drop=True)   # shuffle
-print(f"Loaded {len(baseline_df)} rows from {BASELINE_SHARD}.")
+_local = hf_hub_download("tomg-group-umd/pixelprose", SHARD, repo_type="dataset")
+df = pd.read_parquet(_local, columns=["url", "vlm_caption"])
+df = df.sample(frac=1.0, random_state=2).reset_index(drop=True)   # shuffle
+print(f"Loaded {len(df)} rows from {SHARD}.")
 
 
 def fetch_image(url, timeout=10):
@@ -176,12 +182,12 @@ def derange(pairs):
     return list(zip(images, shifted))
 
 
-baseline_pairs = derange(pull_pairs(baseline_df, N_PAIRS))
-print(f"\nPulled {len(baseline_pairs)} baseline pairs.")
+mismatched_pairs = derange(pull_pairs(df, N_PAIRS))
+print(f"\nPulled {len(mismatched_pairs)} mismatched pairs.")
 
 
 # ---------------------------------------------------------------------------
-# Step 2: BASELINE per-layer cosine(avg vision vector, avg text vector)
+# Step 2: per-layer cosine machinery
 # ---------------------------------------------------------------------------
 _text_config = model.config.get_text_config()
 # Read the TEXT stack's depth first: on some VLM configs a top-level
@@ -196,7 +202,21 @@ def measure_cosine_per_layer(pairs):
     cosine between the vision and text representations. Returns a dict of three
     per-layer curves (each a list of N_LAYERS floats, layers 1..N_LAYERS):
 
-      "paired"    mean_i cos(vision_i, text_i)  <- PRIMARY.
+      "paired_centered"  mean_i cos(vision_i - mu_L, text_i - mu_L)  <- PRIMARY.
+                  mu_L = the mean over EVERY token at layer L across all pairs
+                  (the corpus mean). Cosine measures angle from the ORIGIN, but
+                  activations sit in a tight cone far from it, so an uncentered
+                  cosine is dominated by that shared offset rather than by any
+                  vision/text relationship. Subtracting mu_L asks the real
+                  question: does THIS pair's image deviate from the corpus
+                  baseline in the same direction as ITS caption?
+                  Only valid per-pair. Centering the GRAND means is degenerate:
+                  mu_L is a weighted average of the two modality means, so it
+                  lies on the segment between them and the two centered grand
+                  means come out exactly antiparallel (cos = -1) for ANY data.
+                  Hence there is deliberately no "grandmean_centered".
+
+      "paired"    mean_i cos(vision_i, text_i)  <- uncentered.
                   One cosine per pair, then averaged. Each cosine compares a
                   pair's own image against its own text, so the image/caption
                   correspondence SURVIVES the aggregation.
@@ -219,6 +239,8 @@ def measure_cosine_per_layer(pairs):
     layers = range(1, N_LAYERS + 1)            # 1..N  (skip the embedding, layer 0)
     vis_means = {L: [] for L in layers}        # per layer: list of per-pair vision means
     txt_means = {L: [] for L in layers}
+    tok_sums = {L: None for L in layers}       # per layer: running sum over ALL tokens
+    tok_count = 0                              # total tokens seen (same for every layer)
 
     for i, (image, caption) in enumerate(pairs):
         inputs = build_inputs(image, caption)
@@ -226,57 +248,51 @@ def measure_cosine_per_layer(pairs):
         vision_mask = ids == image_token_id
         text_mask = ~vision_mask               # ALL non-vision tokens = text
         print(f"  [{i + 1}/{len(pairs)}] forward ...", flush=True)
-        # Publish this sequence's vision mask for the ablation hook. Harmless on an
-        # unablated run (no hook is registered), required on an ablated one.
-        global CURRENT_VISION_MASK
-        CURRENT_VISION_MASK = vision_mask.to(device)
         with torch.no_grad():
             out = model(**inputs, output_hidden_states=True)
         for L in layers:
             h = out.hidden_states[L][0].float()              # [seq, d_model]
             vis_means[L].append(h[vision_mask].mean(dim=0))  # this pair's mean vision vector
             txt_means[L].append(h[text_mask].mean(dim=0))    # this pair's mean text vector
+            col = h.sum(dim=0)                               # accumulate for the corpus mean
+            tok_sums[L] = col if tok_sums[L] is None else tok_sums[L] + col
+        tok_count += int(ids.shape[0])
         del out
 
     cos = torch.nn.functional.cosine_similarity
     paired, cross, grandmean = [], [], []
+    paired_centered, cross_centered = [], []
     for L in layers:
         V = torch.stack(vis_means[L])                      # [n_pairs, d_model]
         T = torch.stack(txt_means[L])                      # [n_pairs, d_model]
-        paired.append(cos(V, T, dim=1).mean().item())      # row i vs row i
         T_shift = torch.roll(T, shifts=-1, dims=0)         # row i vs row i+1
+        mu = tok_sums[L] / tok_count                       # corpus mean [d_model]
+
+        paired.append(cos(V, T, dim=1).mean().item())      # row i vs row i
         cross.append(cos(V, T_shift, dim=1).mean().item())
         grandmean.append(cos(V.mean(dim=0), T.mean(dim=0), dim=0).item())
-    return {"paired": paired, "cross": cross, "grandmean": grandmean}
 
+        # CENTERED (headline) + its matching control. Both must be centered, or
+        # the paired-minus-cross difference compares two different spaces.
+        paired_centered.append(cos(V - mu, T - mu, dim=1).mean().item())
+        cross_centered.append(cos(V - mu, T_shift - mu, dim=1).mean().item())
 
-baseline_res = measure_cosine_per_layer(baseline_pairs)
-baseline_cosines = baseline_res["paired"]
-print("\nBaseline cosine(vision, text) per layer   [paired | cross | grandmean]:")
-for i, L in enumerate(range(1, N_LAYERS + 1)):
-    print(f"  layer {L:2d}: {baseline_res['paired'][i]:+.4f} | "
-          f"{baseline_res['cross'][i]:+.4f} | {baseline_res['grandmean'][i]:+.4f}")
+    return {"paired_centered": paired_centered, "cross_centered": cross_centered,
+            "paired": paired, "cross": cross, "grandmean": grandmean}
 
 
 # ---------------------------------------------------------------------------
-# Step 3: ABLATED run. Pull a NEW disjoint 25 pairs; project the (single,
-# embedding-level) candidate vector out of hidden_states[0] BEFORE block 1 via a
-# forward-pre-hook (propagates through all layers); re-measure the cosine.
+# Step 3: ABLATED run. Project the (single, embedding-level) candidate vector
+# out of ALL token embeddings in hidden_states[0], BEFORE block 1, via a
+# forward-pre-hook (it propagates through every following block). Vision and
+# text are both ablated. This is the ONLY run: there is no unablated arm.
 # ---------------------------------------------------------------------------
-# A new shard for the ablated set: baseline=cc12m_01, candidate=cc12m_03, this=cc12m_02.
-ABLATED_SHARD = "data/vlm_captions_cc12m_02.parquet"
-_local2 = hf_hub_download("tomg-group-umd/pixelprose", ABLATED_SHARD, repo_type="dataset")
-ablated_df = pd.read_parquet(_local2, columns=["url", "vlm_caption"])
-ablated_df = ablated_df.sample(frac=1.0, random_state=2).reset_index(drop=True)   # shuffle
-print(f"\nLoaded {len(ablated_df)} rows from {ABLATED_SHARD}.")
-ablated_pairs = derange(pull_pairs(ablated_df, N_PAIRS))
-print(f"\nPulled {len(ablated_pairs)} ablated pairs.")
 
 
 # Forward-PRE-hook on the FIRST decoder layer: its input is hidden_states[0] (the
-# embeddings, before block 1). Project v_hat out of the VISION tokens there ONLY;
-# it then propagates through every following block. Text embeddings are left
-# untouched, and no other layer is touched.
+# embeddings, before block 1). Project v_hat out of EVERY token there — vision
+# and text alike; it then propagates through every following block. No other
+# layer is touched.
 def first_decoder_layer(model):
     """Block 1 of the LANGUAGE model. Walk the known attribute paths first: a
     class-name filter over named_modules() is fragile across architectures, since
@@ -305,46 +321,35 @@ assert len(first_layer.state_dict()) > 0, "resolved an empty module as block 1"
 print(f"Ablation hook site: {_hook_site}  ({first_layer.__class__.__name__})")
 
 
-# The hook sees only hidden states, not input_ids, so the current sequence's
-# vision mask is handed to it through this module-level slot. measure_cosine_per_layer
-# sets it immediately before every forward pass.
-CURRENT_VISION_MASK = None
-
-
 def ablate_embed_pre_hook(module, args, kwargs):
-    """Project v_hat out of the VISION token embeddings only.
+    """Project v_hat out of EVERY token embedding — vision and text alike.
 
-    The text embeddings (caption, prompt, and all structural/sink tokens) are
-    left untouched: we are removing the modality direction from the image side
-    and asking whether the model still separates the two streams, not rewriting
-    both sides of the comparison at once."""
+    Two-sided by design: it puts both modalities on the same hyperplane
+    (h . v_hat == 0), so the gap along this axis is removed symmetrically rather
+    than one side being moved relative to the other."""
     h = args[0]                                             # hidden_states[0]: [B, seq, d]
-    mask = CURRENT_VISION_MASK
-    assert mask is not None, "CURRENT_VISION_MASK not set before the forward pass"
-    assert mask.shape[0] == h.shape[1], (
-        f"vision mask covers {mask.shape[0]} positions but the sequence is {h.shape[1]}")
-
     coord = torch.matmul(h.float(), vhat)                  # (h . v_hat): [B, seq]
-    delta = (coord.unsqueeze(-1) * vhat).to(h.dtype)       # (h.v_hat) v_hat
-    delta = delta * mask.to(h.dtype).view(1, -1, 1)        # zero the edit at text positions
-    return (h - delta, *args[1:]), kwargs
+    h = h - (coord.unsqueeze(-1) * vhat).to(h.dtype)       # h - (h.v_hat) v_hat
+    return (h, *args[1:]), kwargs
 
 
 handle = first_layer.register_forward_pre_hook(ablate_embed_pre_hook, with_kwargs=True)
 try:
-    ablated_res = measure_cosine_per_layer(ablated_pairs)
+    ablated_res = measure_cosine_per_layer(mismatched_pairs)
 finally:
     handle.remove()   # ablation OFF after measuring
 
-ablated_cosines = ablated_res["paired"]
-print("\nAblated cosine(vision, text) per layer   [paired | cross | grandmean]:")
+ablated_cosines = ablated_res["paired_centered"]     # headline metric
+print("\nMismatched + vision-ablated cosine per layer   [centered | cross_c | gap | paired | grandmean]:")
 for i, L in enumerate(range(1, N_LAYERS + 1)):
-    print(f"  layer {L:2d}: {ablated_res['paired'][i]:+.4f} | "
-          f"{ablated_res['cross'][i]:+.4f} | {ablated_res['grandmean'][i]:+.4f}")
+    _gap = ablated_res['paired_centered'][i] - ablated_res['cross_centered'][i]
+    print(f"  layer {L:2d}: {ablated_res['paired_centered'][i]:+.4f} | "
+          f"{ablated_res['cross_centered'][i]:+.4f} | gap {_gap:+.4f} | "
+          f"{ablated_res['paired'][i]:+.4f} | {ablated_res['grandmean'][i]:+.4f}")
 
 
 # ---------------------------------------------------------------------------
-# Step 4: save the numbers + plot baseline vs ablated across layers 1..N_LAYERS
+# Step 4: save the numbers + plot the cosine curve across layers 1..N_LAYERS
 # ---------------------------------------------------------------------------
 import json
 
@@ -353,21 +358,62 @@ import matplotlib.pyplot as plt
 HERE = os.path.dirname(os.path.abspath(__file__))
 layers = list(range(1, N_LAYERS + 1))
 
+# ---------------------------------------------------------------------------
+# Comparison baseline: the ABLATED arm of the MATCHED experiment for this model.
+# ---------------------------------------------------------------------------
+# Same model, same shard (cc12m_02), same seed, same two-sided layer-0
+# ablation — the one and only difference is that those pairs were correctly
+# matched. That makes it the right dotted reference for this curve. Override the
+# location with MATCHED_COSINE_DIR=/path/to/dir if the matched run lives
+# somewhere else.
+MATCHED_DIR = os.environ.get(
+    "MATCHED_COSINE_DIR",
+    os.path.join(HERE, "..", "..", "cosine_similarity", "achintyan", os.path.basename(HERE)))
+_matched_path = os.path.join(MATCHED_DIR, "cosine_results.json")
+
+matched_ablated = None
+if os.path.exists(_matched_path):
+    with open(_matched_path) as f:
+        _matched_blob = json.load(f)
+    # Never overlay another model's curve: the layer axis can line up by accident
+    # (Qwen2-VL-2B and -7B are both 28 layers) while the spaces are unrelated.
+    if _matched_blob.get("model_id") != MODEL_ID:
+        raise SystemExit(
+            f"\n{_matched_path} holds results for {_matched_blob.get('model_id')}, but "
+            f"this run is {MODEL_ID}.\nPoint MATCHED_COSINE_DIR at the matched run for "
+            f"this model, or re-run its cosine_experiment.py.")
+    _abl = _matched_blob["ablated"]
+    # Current format: a dict of curves, of which "paired_centered" is the headline.
+    # Anything older (a dict without it, or a bare list from the grandmean era) is
+    # a DIFFERENT metric — refuse to overlay it rather than draw a misleading plot.
+    matched_ablated = (_abl["paired_centered"] if isinstance(_abl, dict)
+                       and "paired_centered" in _abl else None)
+    if matched_ablated is None:
+        print("  WARNING: the matched results predate the centering change (no "
+              "'paired_centered' curve), so they are NOT comparable to this run. "
+              "Re-run cosine_experiment.py for this model; plotting alone for now.")
+    else:
+        print(f"Loaded matched-ablated (centered) curve from {_matched_path}.")
+else:
+    print(f"{_matched_path} not found — plotting the mismatched curve alone.")
+
+
 with open(os.path.join(HERE, "mismatched_cosine_results.json"), "w") as f:
     json.dump({"model_id": MODEL_ID, "n_pairs": N_PAIRS, "layers": layers,
-               "metric": "paired = mean over pairs of cos(vision_i, text_i)",
-               "baseline": baseline_res, "ablated": ablated_res}, f, indent=2)
+               "metric": "paired_centered = mean over pairs of cos(vision_i - mu_L, text_i - mu_L); cross_centered/paired/cross/grandmean also saved",
+               "shard": SHARD, "derangement": "caption cyclic shift by 1",
+               "ablation": "all token embeddings (vision + text), hidden_states[0]",
+               "mismatched_ablated": ablated_res,
+               "matched_ablated_paired": matched_ablated}, f, indent=2)
 
 fig, ax = plt.subplots(figsize=(9, 5))
-ax.plot(layers, baseline_cosines, "-o", color="#4C72B0", label="Mismatched, unmodified")
+if matched_ablated is not None:
+    ax.plot(layers, matched_ablated, ":", color="#7F7F7F", linewidth=2,
+            label="Matched pairs + same ablation (baseline)")
 ax.plot(layers, ablated_cosines, "-o", color="#C44E52",
-        label="Mismatched, vision embeddings ablated at layer 0")
-# The cross-paired control (image vs. another pair's text) is still computed and
-# saved to the JSON as "cross", but it is deliberately NOT plotted here — this
-# figure is the plain baseline-vs-ablated comparison. The mismatched-pairs
-# experiment is where that control belongs.
+        label="Mismatched pairs, candidate vector ablated at layer 0")
 ax.set_xlabel("Layer")
-ax.set_ylabel("cosine(mean vision, mean text)")
+ax.set_ylabel("centered cosine(vision, text)")
 ax.set_xticks(range(0, N_LAYERS + 1, 2))
 ax.set_xlim(min(layers) - 0.5, max(layers) + 0.5)
 ax.grid(alpha=0.3)
@@ -376,9 +422,11 @@ ax.spines["right"].set_visible(False)
 ax.legend()
 plt.title(
     "Vision-text similarity across layers — MISMATCHED pairs\n"
-    f"{MODEL_ID.split('/')[-1]}, {N_PAIRS} pairs each, mean of per-pair cosines"
+    f"{MODEL_ID.split('/')[-1]}, {len(mismatched_pairs)} pairs, layer-0 ablation, "
+    "centered per-pair cosines"
 )
 fig.tight_layout()
-out = os.path.join(HERE, "mismatched_cosine_comparison.png")
-fig.savefig(out, dpi=150)
+out = os.path.join(HERE, "mismatched_cosine_comparison.pdf")
+plt.rcParams["pdf.fonttype"] = 42        # embed TrueType: text stays selectable
+fig.savefig(out, format="pdf", bbox_inches="tight")
 print(f"\nsaved {out}")

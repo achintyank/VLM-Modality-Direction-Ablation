@@ -1,37 +1,34 @@
 """
-mismatched_cosine_experiment.py — the cosine-similarity modality-gap experiment
-(PaliGemma2-3B pt-224) re-run on MISMATCHED image/caption pairs.
+cosine_experiment.py — cosine-similarity modality-gap experiment (Gemma-4 E2B).
 
-Why
----
-The matched experiment pairs each image with its OWN PixelProse caption, which
-confounds modality (vision vs. text) with semantic content (the caption
-describes the image). This run breaks the semantic link and changes nothing
-else: same model, same shards, same seeds, same metric, same two-sided
-layer-0 ablation, same candidate vector. Only the PAIRING is deranged.
+Model notes (from the published config):
+  - text_config.num_hidden_layers = 35, while vision_config is 16 and audio_config
+    is 12. The layer count is read TEXT-CONFIG-FIRST for that reason — picking up
+    a tower's depth here would silently measure the wrong range.
+  - text_config.hidden_size = 1536, which is the SAME as Qwen2-VL-2B. The
+    dimension assert on the candidate vector therefore cannot catch a 2B vector
+    dropped into this folder; the model_id assert is what protects you. Do not
+    reuse a candidate_vector.pt across those two models.
+  - image_token_id = 258880, at the top level of the config.
+  - Gemma-4 is also an audio model. Only image + text are exercised here; "text"
+    still means every non-image token.
 
-Read it against the matched run in cosine_similarity/achintyan/palig2-3b:
-  - the two track each other  -> the trajectory does not depend on the caption
-    describing the image, so it is not semantic binding.
-  - they diverge              -> semantic alignment is doing real work.
 
-ONE run only: deranged pairs, vision-embedding ablation, record the per-layer
-cosines. There is no unablated arm here — the comparison curve is the ablated
-arm of the matched experiment, which used this same shard and seed.
+Per layer (hidden_states[1..N]), measure how similar the AVERAGE vision-token
+representation is to the AVERAGE text-token representation (cosine), for:
+  - a BASELINE run (unmodified), and
+  - an ABLATED run: the candidate vector (from compute_candidates.py) projected
+    out of ALL token embeddings (vision and text) in hidden_states[0] ONLY,
+    before block 1, propagating onward.
+Then plot both cosine curves across layers to see if/where the modality gap closes
+and how the input-ablation changes that trajectory.
 
-Method (identical to the matched run)
   - text = ALL non-vision tokens (input_ids != image_token_id).
-  - ARCHITECTURE CAVEAT: PaliGemma attends BIDIRECTIONALLY over the prefix
-    (image + prompt) and causally only over the suffix, whereas Qwen2-VL is
-    causal throughout. Vision tokens here can therefore see the caption
-    tokens directly. Curves are comparable to the Qwen ones in shape, but a
-    difference between models may come from this masking, not from scale.
   - cosine per layer = mean over pairs of cos(vision_i - mu_L, text_i - mu_L),
-    centered on the corpus mean mu_L at that layer, where text_i is the caption
-    that pair was DERANGED onto. Centering matters: uncentered, matched and
-    mismatched pairs differ by ~0.03; centered the gap is ~0.12 and grows with
-    depth, so the uncentered metric could barely see this experiment's effect. One cosine per pair, THEN averaged, so the
-    image/caption correspondence survives the aggregation.
+    where mu_L is the corpus mean over every token at that layer. One cosine per
+    pair, THEN averaged, so the image/caption correspondence survives; centered,
+    so the number is not dominated by the shared offset all activations carry.
+    The uncentered "paired" curve is still computed and saved alongside it.
     (The earlier metric — collapse to one mean vector per modality, then a single
     cosine — averaged the pairing away before comparing and was therefore nearly
     blind to semantic alignment. It is still computed and saved as "grandmean"
@@ -45,9 +42,6 @@ Method (identical to the matched run)
     vector came from a third, separate set (compute_candidates.py, cc12m_03).
 
 Built step by step. Steps 1-3 done (baseline + ablated cosines); step 4 = plot.
-  - pairs are DERANGED after they are pulled (see derange() below).
-  - ablation removes the candidate direction from ALL token embeddings, vision
-    and text alike (two-sided, symmetric).
 """
 
 import io
@@ -62,28 +56,46 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
 # ---------------------------------------------------------------------------
-# Load PaliGemma2-3B pt-224 (same model the candidate vector must be built on)
+# Load Gemma-4 E2B (same model the candidate vector must be built on)
 # ---------------------------------------------------------------------------
-MODEL_ID = "google/paligemma2-3b-pt-224"
+MODEL_ID = "google/gemma-4-E2B"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16
 
-# PaliGemma2 is a gated repo on the Hub — `huggingface-cli login` first, or the
-# from_pretrained below 401s. AutoModelForImageTextToText resolves the right class
-# from the config rather than hardcoding one.
-model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, torch_dtype=dtype).to(device)
+# Gemma-4 registers as Gemma4ForConditionalGeneration. AutoModelForImageTextToText
+# should resolve it from the config; if this transformers build does not have
+# gemma4 mapped into that Auto class yet, fall back to the concrete class by name
+# rather than failing with an unhelpful KeyError.
+try:
+    model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, torch_dtype=dtype).to(device)
+except (KeyError, ValueError) as e:
+    import transformers
+    _cls = getattr(transformers, "Gemma4ForConditionalGeneration", None)
+    if _cls is None:
+        raise RuntimeError(
+            f"transformers {transformers.__version__} cannot load {MODEL_ID} "
+            f"(no gemma4 mapping and no Gemma4ForConditionalGeneration). Upgrade it."
+        ) from e
+    print(f"AutoModelForImageTextToText failed ({e}); using Gemma4ForConditionalGeneration.")
+    model = _cls.from_pretrained(MODEL_ID, torch_dtype=dtype).to(device)
 model.eval()
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 print(f"Model loaded on {device}.")
 
-# PaliGemma names this image_token_index, Qwen names it image_token_id — check
-# both, then fall back to looking up the <image> token in the tokenizer.
-image_token_id = getattr(model.config, "image_token_index", None)
+# Gemma-4 puts image_token_id at the TOP level of the config (258880); it has no
+# image_token_index, and its image placeholder is not Qwen's <|image_pad|>. Read
+# the config first and only guess at a token string as a last resort.
+image_token_id = getattr(model.config, "image_token_id", None)
 if image_token_id is None:
-    image_token_id = getattr(model.config, "image_token_id", None)
+    image_token_id = getattr(model.config, "image_token_index", None)
 if image_token_id is None:
-    image_token_id = processor.tokenizer.convert_tokens_to_ids("<image>")
+    for _tok in ("<image_soft_token>", "<image>", "<start_of_image>"):
+        _id = processor.tokenizer.convert_tokens_to_ids(_tok)
+        if _id is not None and _id != processor.tokenizer.unk_token_id:
+            image_token_id = _id
+            break
 assert image_token_id is not None, "could not resolve the image token id"
+print(f"image_token_id = {image_token_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -116,25 +128,19 @@ print(f"Loaded candidate vector ({_cand_blob['level']}, d={_cand.shape[0]}) buil
 
 
 # ---------------------------------------------------------------------------
-# Step 1: pull 500 random image+caption pairs (local shard)
+# Step 1: pull 500 random BASELINE image+caption pairs (local shard)
 # ---------------------------------------------------------------------------
 N_PAIRS = 500
-# pt-224 encodes EVERY image to exactly 256 tokens (a fixed 224x224 / 14px grid,
-# unlike Qwen2-VL's variable count), so these bounds never actually reject an
-# image here. They are kept as a tripwire: if n_vis is ever not 256, the
-# processor is not doing what this script assumes.
-EXPECTED_VISION_TOKENS = 256
 MAX_VISION_TOKENS = 1000
 MIN_VISION_TOKENS = 4
 PROMPT_TEXT = "What is in the image?"
-# Same shard/seed the matched experiment used for its ablated arm, so this run
-# differs from it in exactly one way: the pairing is deranged.
-SHARD = "data/vlm_captions_cc12m_02.parquet"
+# Baseline shard — distinct from the candidate set (cc12m_03) and the ablated set.
+BASELINE_SHARD = "data/vlm_captions_cc12m_01.parquet"
 
-_local = hf_hub_download("tomg-group-umd/pixelprose", SHARD, repo_type="dataset")
-df = pd.read_parquet(_local, columns=["url", "vlm_caption"])
-df = df.sample(frac=1.0, random_state=2).reset_index(drop=True)   # shuffle
-print(f"Loaded {len(df)} rows from {SHARD}.")
+_local = hf_hub_download("tomg-group-umd/pixelprose", BASELINE_SHARD, repo_type="dataset")
+baseline_df = pd.read_parquet(_local, columns=["url", "vlm_caption"])
+baseline_df = baseline_df.sample(frac=1.0, random_state=1).reset_index(drop=True)   # shuffle
+print(f"Loaded {len(baseline_df)} rows from {BASELINE_SHARD}.")
 
 
 def fetch_image(url, timeout=10):
@@ -147,14 +153,14 @@ def fetch_image(url, timeout=10):
 
 
 def build_inputs(image, caption):
-    """image + caption + question, PaliGemma style.
-
-    NOT the Qwen path: paligemma2-3b-pt-224 is a PRETRAINED checkpoint with no
-    chat template, so apply_chat_template does not apply. The processor takes the
-    raw prompt string and the image directly — it prepends the 256 <image>
-    tokens, then BOS, the prompt, and a trailing newline."""
+    """image + caption + question via the Qwen2-VL chat template."""
     text = f"{caption}\n{PROMPT_TEXT}"
-    return processor(text=text, images=image, return_tensors="pt").to(device)
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": image},
+        {"type": "text", "text": text},
+    ]}]
+    chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return processor(text=[chat_text], images=[image], return_tensors="pt").to(device)
 
 
 def pull_pairs(df, n):
@@ -172,40 +178,26 @@ def pull_pairs(df, n):
             continue
         inputs = build_inputs(image, caption)
         n_vis = int((inputs["input_ids"][0] == image_token_id).sum())
-        assert n_vis == EXPECTED_VISION_TOKENS, (
-            f"expected {EXPECTED_VISION_TOKENS} vision tokens from {MODEL_ID}, got {n_vis}")
         if n_vis < MIN_VISION_TOKENS or n_vis >= MAX_VISION_TOKENS:
             continue
         pairs.append((image, caption))
         print(f"  pulled {len(pairs)}/{n} (n_vis={n_vis})", flush=True)
+    # An empty haul almost always means the chat template did not expand the image
+    # placeholder, so every n_vis was 0 and every row was skipped — a silent failure
+    # that would otherwise surface as a nan cosine much later.
+    assert len(pairs) == n, (
+        f"only collected {len(pairs)}/{n} pairs. If n_vis was 0 throughout, the "
+        f"processor is not inserting image_token_id={image_token_id} — check the "
+        f"chat-template path in build_inputs against this model's expected format.")
     return pairs
 
 
-def derange(pairs):
-    """Break the image/caption correspondence: image[i] keeps its own image but
-    takes caption[i+1] (the last wraps to the first). A cyclic shift of 1 over
-    >1 pairs guarantees no image keeps its own caption, so a picture of a cat
-    ends up captioned as a watermelon.
-
-    The multiset of images and the multiset of captions are unchanged — caption
-    length and style still come from this same shard — so the ONLY thing that
-    differs from the matched experiment is which caption goes with which image."""
-    assert len(pairs) > 1, "cannot derange fewer than 2 pairs"
-    images = [img for img, _ in pairs]
-    captions = [cap for _, cap in pairs]
-    shifted = captions[1:] + captions[:1]
-    assert all(a is not b for a, b in zip(captions, shifted)), \
-        "derangement failed: a caption stayed with its own image"
-    print(f"  deranged {len(pairs)} pairs (captions shifted by 1)")
-    return list(zip(images, shifted))
-
-
-mismatched_pairs = derange(pull_pairs(df, N_PAIRS))
-print(f"\nPulled {len(mismatched_pairs)} mismatched pairs.")
+baseline_pairs = pull_pairs(baseline_df, N_PAIRS)
+print(f"\nPulled {len(baseline_pairs)} baseline pairs.")
 
 
 # ---------------------------------------------------------------------------
-# Step 2: per-layer cosine machinery
+# Step 2: BASELINE per-layer cosine(avg vision vector, avg text vector)
 # ---------------------------------------------------------------------------
 _text_config = model.config.get_text_config()
 # Read the TEXT stack's depth first: on some VLM configs a top-level
@@ -299,12 +291,29 @@ def measure_cosine_per_layer(pairs):
             "paired": paired, "cross": cross, "grandmean": grandmean}
 
 
+baseline_res = measure_cosine_per_layer(baseline_pairs)
+baseline_cosines = baseline_res["paired_centered"]   # headline metric
+print("\nBaseline cosine(vision, text) per layer   [centered | cross_c | gap | paired | grandmean]:")
+for i, L in enumerate(range(1, N_LAYERS + 1)):
+    _gap = baseline_res['paired_centered'][i] - baseline_res['cross_centered'][i]
+    print(f"  layer {L:2d}: {baseline_res['paired_centered'][i]:+.4f} | "
+          f"{baseline_res['cross_centered'][i]:+.4f} | gap {_gap:+.4f} | "
+          f"{baseline_res['paired'][i]:+.4f} | {baseline_res['grandmean'][i]:+.4f}")
+
+
 # ---------------------------------------------------------------------------
-# Step 3: ABLATED run. Project the (single, embedding-level) candidate vector
-# out of ALL token embeddings in hidden_states[0], BEFORE block 1, via a
-# forward-pre-hook (it propagates through every following block). Vision and
-# text are both ablated. This is the ONLY run: there is no unablated arm.
+# Step 3: ABLATED run. Pull a NEW disjoint 25 pairs; project the (single,
+# embedding-level) candidate vector out of hidden_states[0] BEFORE block 1 via a
+# forward-pre-hook (propagates through all layers); re-measure the cosine.
 # ---------------------------------------------------------------------------
+# A new shard for the ablated set: baseline=cc12m_01, candidate=cc12m_03, this=cc12m_02.
+ABLATED_SHARD = "data/vlm_captions_cc12m_02.parquet"
+_local2 = hf_hub_download("tomg-group-umd/pixelprose", ABLATED_SHARD, repo_type="dataset")
+ablated_df = pd.read_parquet(_local2, columns=["url", "vlm_caption"])
+ablated_df = ablated_df.sample(frac=1.0, random_state=2).reset_index(drop=True)   # shuffle
+print(f"\nLoaded {len(ablated_df)} rows from {ABLATED_SHARD}.")
+ablated_pairs = pull_pairs(ablated_df, N_PAIRS)
+print(f"\nPulled {len(ablated_pairs)} ablated pairs.")
 
 
 # Forward-PRE-hook on the FIRST decoder layer: its input is hidden_states[0] (the
@@ -353,12 +362,12 @@ def ablate_embed_pre_hook(module, args, kwargs):
 
 handle = first_layer.register_forward_pre_hook(ablate_embed_pre_hook, with_kwargs=True)
 try:
-    ablated_res = measure_cosine_per_layer(mismatched_pairs)
+    ablated_res = measure_cosine_per_layer(ablated_pairs)
 finally:
     handle.remove()   # ablation OFF after measuring
 
 ablated_cosines = ablated_res["paired_centered"]     # headline metric
-print("\nMismatched + vision-ablated cosine per layer   [centered | cross_c | gap | paired | grandmean]:")
+print("\nAblated cosine(vision, text) per layer   [centered | cross_c | gap | paired | grandmean]:")
 for i, L in enumerate(range(1, N_LAYERS + 1)):
     _gap = ablated_res['paired_centered'][i] - ablated_res['cross_centered'][i]
     print(f"  layer {L:2d}: {ablated_res['paired_centered'][i]:+.4f} | "
@@ -367,7 +376,7 @@ for i, L in enumerate(range(1, N_LAYERS + 1)):
 
 
 # ---------------------------------------------------------------------------
-# Step 4: save the numbers + plot the cosine curve across layers 1..N_LAYERS
+# Step 4: save the numbers + plot baseline vs ablated across layers 1..N_LAYERS
 # ---------------------------------------------------------------------------
 import json
 
@@ -376,60 +385,19 @@ import matplotlib.pyplot as plt
 HERE = os.path.dirname(os.path.abspath(__file__))
 layers = list(range(1, N_LAYERS + 1))
 
-# ---------------------------------------------------------------------------
-# Comparison baseline: the ABLATED arm of the MATCHED experiment for this model.
-# ---------------------------------------------------------------------------
-# Same model, same shard (cc12m_02), same seed, same two-sided layer-0
-# ablation — the one and only difference is that those pairs were correctly
-# matched. That makes it the right dotted reference for this curve. Override the
-# location with MATCHED_COSINE_DIR=/path/to/dir if the matched run lives
-# somewhere else.
-MATCHED_DIR = os.environ.get(
-    "MATCHED_COSINE_DIR",
-    os.path.join(HERE, "..", "..", "cosine_similarity", "achintyan", os.path.basename(HERE)))
-_matched_path = os.path.join(MATCHED_DIR, "cosine_results.json")
-
-matched_ablated = None
-if os.path.exists(_matched_path):
-    with open(_matched_path) as f:
-        _matched_blob = json.load(f)
-    # Never overlay another model's curve: the layer axis can line up by accident
-    # (Qwen2-VL-2B and -7B are both 28 layers) while the spaces are unrelated.
-    if _matched_blob.get("model_id") != MODEL_ID:
-        raise SystemExit(
-            f"\n{_matched_path} holds results for {_matched_blob.get('model_id')}, but "
-            f"this run is {MODEL_ID}.\nPoint MATCHED_COSINE_DIR at the matched run for "
-            f"this model, or re-run its cosine_experiment.py.")
-    _abl = _matched_blob["ablated"]
-    # Current format: a dict of curves, of which "paired_centered" is the headline.
-    # Anything older (a dict without it, or a bare list from the grandmean era) is
-    # a DIFFERENT metric — refuse to overlay it rather than draw a misleading plot.
-    matched_ablated = (_abl["paired_centered"] if isinstance(_abl, dict)
-                       and "paired_centered" in _abl else None)
-    if matched_ablated is None:
-        print("  WARNING: the matched results predate the centering change (no "
-              "'paired_centered' curve), so they are NOT comparable to this run. "
-              "Re-run cosine_experiment.py for this model; plotting alone for now.")
-    else:
-        print(f"Loaded matched-ablated (centered) curve from {_matched_path}.")
-else:
-    print(f"{_matched_path} not found — plotting the mismatched curve alone.")
-
-
-with open(os.path.join(HERE, "mismatched_cosine_results.json"), "w") as f:
+with open(os.path.join(HERE, "cosine_results.json"), "w") as f:
     json.dump({"model_id": MODEL_ID, "n_pairs": N_PAIRS, "layers": layers,
                "metric": "paired_centered = mean over pairs of cos(vision_i - mu_L, text_i - mu_L); cross_centered/paired/cross/grandmean also saved",
-               "shard": SHARD, "derangement": "caption cyclic shift by 1",
-               "ablation": "all token embeddings (vision + text), hidden_states[0]",
-               "mismatched_ablated": ablated_res,
-               "matched_ablated_paired": matched_ablated}, f, indent=2)
+               "baseline": baseline_res, "ablated": ablated_res}, f, indent=2)
 
 fig, ax = plt.subplots(figsize=(9, 5))
-if matched_ablated is not None:
-    ax.plot(layers, matched_ablated, ":", color="#7F7F7F", linewidth=2,
-            label="Matched pairs + same ablation (baseline)")
+ax.plot(layers, baseline_cosines, "-o", color="#4C72B0", label="Baseline (unmodified)")
 ax.plot(layers, ablated_cosines, "-o", color="#C44E52",
-        label="Mismatched pairs, candidate vector ablated at layer 0")
+        label="Ablated (candidate vector removed at layer 0)")
+# The cross-paired control (image vs. another pair's text) is still computed and
+# saved to the JSON as "cross", but it is deliberately NOT plotted here — this
+# figure is the plain baseline-vs-ablated comparison. The mismatched-pairs
+# experiment is where that control belongs.
 ax.set_xlabel("Layer")
 ax.set_ylabel("centered cosine(vision, text)")
 ax.set_xticks(range(0, N_LAYERS + 1, 2))
@@ -439,12 +407,11 @@ ax.spines["top"].set_visible(False)
 ax.spines["right"].set_visible(False)
 ax.legend()
 plt.title(
-    "Vision-text similarity across layers — MISMATCHED pairs\n"
-    f"{MODEL_ID.split('/')[-1]}, {len(mismatched_pairs)} pairs, layer-0 ablation, "
-    "centered per-pair cosines"
+    "Vision-text representational similarity across layers\n"
+    f"{MODEL_ID.split('/')[-1]}, {N_PAIRS} pairs each, centered per-pair cosines"
 )
 fig.tight_layout()
-out = os.path.join(HERE, "mismatched_cosine_comparison.pdf")
+out = os.path.join(HERE, "cosine_comparison.pdf")
 plt.rcParams["pdf.fonttype"] = 42        # embed TrueType: text stays selectable
 fig.savefig(out, format="pdf", bbox_inches="tight")
 print(f"\nsaved {out}")
