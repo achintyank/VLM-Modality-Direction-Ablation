@@ -66,9 +66,25 @@ if image_token_id is None:
 # purpose: a mismatched vector must fail immediately, not after a few hundred
 # forward passes. d_model is 3584 on Qwen2-VL-7B and 1536 on the 2B, so building
 # the vector under one MODEL_ID and ablating under the other blows up mid-run.
-CAND_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "candidate_vector.pt")
+# Universal candidate vectors live at <repo>/candidate_vectors/. Walk up from this
+# file to find the repo root rather than hardcoding "../../.." -- experiment folders
+# in this repo get moved and renamed, and a relative chain silently breaks when they do.
+def _repo_root(start):
+    d = os.path.dirname(os.path.abspath(start))
+    while d != os.path.dirname(d):
+        if os.path.isdir(os.path.join(d, "candidate_vectors")):
+            return d
+        d = os.path.dirname(d)
+    raise RuntimeError(f"could not find candidate_vectors/ above {start}")
+
+CAND_PATH = os.path.join(_repo_root(__file__), "candidate_vectors", "qwen/2-7b", "candidate_vectors.pt")
 _cand_blob = torch.load(CAND_PATH, weights_only=False)
-_cand = _cand_blob["candidate"].float()
+# candidates[0] is hidden_states[0], the embedding level this experiment ablates at.
+# The universal file is built caption-minus-vision, so the contrast holds semantics
+# roughly constant and isolates modality -- unlike the retired all-non-vision recipe,
+# whose "text" side (system prompt, question, sink) differs from the image in meaning
+# as well as modality.
+_cand = _cand_blob["candidates"][0].float()
 
 _d_model = model.config.get_text_config().hidden_size
 assert _cand_blob["model_id"] == MODEL_ID, (
@@ -77,13 +93,12 @@ assert _cand_blob["model_id"] == MODEL_ID, (
 assert _cand.shape[0] == _d_model, (
     f"candidate vector is {_cand.shape[0]}-dim but {MODEL_ID} has d_model={_d_model}. "
     f"Rebuild candidate_vector.pt with compute_candidates.py under this model.")
-assert _cand_blob["level"] == "hidden_states[0]", (
-    f"candidate vector lives at {_cand_blob['level']}, not hidden_states[0]; this "
-    f"experiment ablates at the embedding level only.")
-
+# NOTE: no "level" assert -- in the universal format candidates[0] IS
+# hidden_states[0] by construction, so there is nothing to check.
 vhat = (_cand / torch.linalg.vector_norm(_cand)).to(device)      # unit direction [d_model]
-print(f"Loaded candidate vector ({_cand_blob['level']}, d={_cand.shape[0]}) built from "
-      f"{_cand_blob['n_pairs']} pairs on {_cand_blob['shard']} — matches {MODEL_ID}.")
+print(f"Loaded candidate vector (hidden_states[0], d={_cand.shape[0]}) built from "
+      f"{_cand_blob['n_pairs']} pairs on {_cand_blob['shard']} "
+      f"[{_cand_blob['recipe']}] — matches {MODEL_ID}.")
 
 
 # ---------------------------------------------------------------------------
@@ -112,14 +127,40 @@ def fetch_image(url, timeout=10):
 
 
 def build_inputs(image, caption):
-    """image + caption + question via the Qwen2-VL chat template."""
-    text = f"{caption}\n{PROMPT_TEXT}"
+    """image + caption + question via the chat template.
+
+    Returns (inputs, caption_mask). caption_mask marks ONLY the caption tokens --
+    never the question, the chat/structural tokens or the attention sink. Those are
+    byte-identical for every pair, so they carry no pairing information: averaging
+    them into the text vector just adds a constant, which dilutes the
+    matched-vs-mismatched signal this experiment exists to measure (and at depth the
+    sink's massive activations can dominate that constant outright).
+    """
+    body = f"{caption}\n{PROMPT_TEXT}"
     messages = [{"role": "user", "content": [
         {"type": "image", "image": image},
-        {"type": "text", "text": text},
+        {"type": "text", "text": body},
     ]}]
     chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return processor(text=[chat_text], images=[image], return_tensors="pt").to(device)
+    inputs = processor(text=[chat_text], images=[image], return_tensors="pt").to(device)
+
+    # --- caption_mask: ONLY the caption tokens -------------------------------
+    # Tokenize `body` alone with char offsets and keep the tokens whose span ends
+    # inside the caption (chars [0, len(caption))), so "\n{question}" is excluded.
+    # Then locate that token subsequence inside the full input.
+    enc = processor.tokenizer(body, add_special_tokens=False, return_offsets_mapping=True)
+    text_ids, offsets = enc["input_ids"], enc["offset_mapping"]
+    cap_end_char = len(caption)
+    cap_positions = [i for i, (a, b) in enumerate(offsets) if b <= cap_end_char and b > a]
+
+    full = inputs["input_ids"][0].tolist()
+    tlen = len(text_ids)
+    start = next((i for i in range(len(full) - tlen + 1) if full[i:i + tlen] == text_ids), None)
+
+    caption_mask = torch.zeros(len(full), dtype=torch.bool, device=device)
+    if start is not None and cap_positions:
+        caption_mask[start + cap_positions[0]: start + cap_positions[-1] + 1] = True
+    return inputs, caption_mask
 
 
 def pull_pairs(df, n):
@@ -135,7 +176,9 @@ def pull_pairs(df, n):
         caption = sample.vlm_caption
         if not isinstance(caption, str) or not caption.strip():
             continue
-        inputs = build_inputs(image, caption)
+        inputs, caption_mask = build_inputs(image, caption)
+        if int(caption_mask.sum()) == 0:
+            continue          # caption span not located -> unusable pair
         n_vis = int((inputs["input_ids"][0] == image_token_id).sum())
         if n_vis < MIN_VISION_TOKENS or n_vis >= MAX_VISION_TOKENS:
             continue
@@ -160,7 +203,7 @@ def measure_cosine_per_layer(pairs):
     cosine between the vision and text representations. Returns a dict of three
     per-layer curves (each a list of N_LAYERS floats, layers 1..N_LAYERS):
 
-      "paired_centered"  mean_i cos(vision_i - mu_L, text_i - mu_L)  <- PRIMARY.
+      "paired_centered"  mean_i cos(vision_i - mu_L, caption_i - mu_L)  <- PRIMARY.
                   mu_L = the mean over EVERY token at layer L across all pairs
                   (the corpus mean). Cosine measures angle from the ORIGIN, but
                   activations sit in a tight cone far from it, so an uncentered
@@ -209,17 +252,22 @@ def measure_cosine_per_layer(pairs):
     tok_count = 0                              # total tokens seen (same for every layer)
 
     for i, (image, caption) in enumerate(pairs):
-        inputs = build_inputs(image, caption)
+        inputs, caption_mask = build_inputs(image, caption)
         ids = inputs["input_ids"][0]
         vision_mask = ids == image_token_id
-        text_mask = ~vision_mask               # ALL non-vision tokens = text
+        # Text side = CAPTION ONLY. An empty mask would make .mean() NaN and poison
+        # every layer's average for the whole run, so drop the pair instead.
+        if int(caption_mask.sum()) == 0 or int(vision_mask.sum()) == 0:
+            print(f"  [{i + 1}/{len(pairs)}] SKIP: n_cap={int(caption_mask.sum())}, "
+                  f"n_vis={int(vision_mask.sum())}", flush=True)
+            continue
         print(f"  [{i + 1}/{len(pairs)}] forward ...", flush=True)
         with torch.no_grad():
             out = model(**inputs, output_hidden_states=True)
         for L in layers:
             h = out.hidden_states[L][0].float()              # [seq, d_model]
             vis_means[L].append(h[vision_mask].mean(dim=0))  # this pair's mean vision vector
-            txt_means[L].append(h[text_mask].mean(dim=0))    # this pair's mean text vector
+            txt_means[L].append(h[caption_mask].mean(dim=0))  # this pair's mean CAPTION vector
             col = h.sum(dim=0)                               # accumulate for the corpus mean
             tok_sums[L] = col if tok_sums[L] is None else tok_sums[L] + col
         tok_count += int(ids.shape[0])
