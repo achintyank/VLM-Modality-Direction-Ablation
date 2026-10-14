@@ -99,11 +99,11 @@ rand_hat = {L: _r[L - 1].to(device).float() for L in range(1, N_LAYERS + 1)}   #
 # pairs are genuinely held out. hf_hub_download caches the file: one ~65MB
 # download the first time, then instant on every re-run.
 # ---------------------------------------------------------------------------
-# Draw 40 held-out pairs: the first CALIB fit the separability threshold (the 3
+# Draw 500 held-out pairs: the first CALIB fit the separability threshold (the 3
 # reference points per layer), the remaining pairs are the disjoint test set we
 # actually score bal_acc/acc on. Must be >= 2 so both halves are non-empty.
-N_HELDOUT = 40
-CALIB = N_HELDOUT // 2          # 20 calibration + 20 test
+N_HELDOUT = 500
+CALIB = N_HELDOUT // 2          # 250 calibration + 250 test
 PROMPT_TEXT = blob.get("prompt_text", "What is in the image?")
 
 SHARD = "data/vlm_captions_cc12m_09.parquet"
