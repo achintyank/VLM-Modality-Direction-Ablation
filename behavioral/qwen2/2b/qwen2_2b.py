@@ -1,17 +1,19 @@
-import io, gc, re, sys, string, random
+import io, gc, os, re, sys, string, random
 from contextlib import contextmanager
 import numpy as np, pandas as pd, torch, requests
 import matplotlib.pyplot as plt
 from PIL import Image
 from tqdm.auto import tqdm
-from scipy.stats import wilcoxon
 from huggingface_hub import hf_hub_download
-from transformers import PaliGemmaForConditionalGeneration, AutoProcessor
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 import json
 from scipy.stats import binomtest
-from google.colab import files
+try:                                   # Colab-only; absent on EC2/local
+    from google.colab import files
+except ImportError:
+    files = None
 
-MODEL_ID       = "Qwen/Qwen2-VL-7B-Instruct"
+MODEL_ID       = "Qwen/Qwen2-VL-2B-Instruct"
 SHARD          = "data/vlm_captions_cc12m_05.parquet"
 SEED           = 42
 N_VEC          = 250                  
@@ -19,8 +21,11 @@ N_TEST         = 250
 MAX_PIXELS     = 512 * 28 * 28        
 VEC_QUESTION   = "What is in the image?"                    
 FC_QUESTION    = "What is the main subject of the image?"  
-CONTROL_THRESH = 0.5                
-OUT_TAG        = "qwen2vl7b_textdom"
+OUT_TAG        = "qwen2vl2b_textdom"
+# Results land beside this script, not in the cwd, so running several model
+# folders from the repo root does not scatter outputs.
+OUT_DIR        = os.path.dirname(os.path.abspath(__file__))
+MAX_NEW        = 16                   # answer budget for the conflict VQA
 
 device = "cuda"
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
@@ -59,10 +64,20 @@ def fwd(inputs):
     return model(**inputs, use_cache=False)
 
 @torch.no_grad()
-def gen(inputs, max_new_tokens):
+def gen_full(inputs, max_new_tokens):
+    """(text, n_new_tokens, eos_hit). eos_hit=False means the answer was cut off at
+    max_new_tokens; skip_special_tokens hides that, and a truncated answer reads as
+    degenerate to any fluency measure, so it has to be tracked explicitly."""
     _reset_rope()
     out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-    return tok.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    new = out[0, inputs["input_ids"].shape[1]:]
+    return (tok.decode(new, skip_special_tokens=True),
+            int(new.shape[0]),
+            bool((new == tok.eos_token_id).any()))
+
+@torch.no_grad()
+def gen(inputs, max_new_tokens):
+    return gen_full(inputs, max_new_tokens)[0]
 
 _local = hf_hub_download("tomg-group-umd/pixelprose", SHARD, repo_type="dataset")
 df = pd.read_parquet(_local, columns=["url", "vlm_caption"])
@@ -169,7 +184,7 @@ cos_l = torch.nn.functional.cosine_similarity(gaps, v_hat[None], dim=-1)
 print(f"n={n}  ||v||={v.norm():.2f}  cos(r_hat, v_hat)={float(r_hat @ v_hat):+.3f}")
 print("per-layer ||gap||:      ", np.round(gaps.norm(dim=-1).numpy(), 1))
 print("per-layer cos(gap, v̂): ", np.round(cos_l.numpy(), 2))
-np.savez(f"modality_vector_{OUT_TAG}.npz", v=v.numpy(), v_hat=v_hat.numpy(),
+np.savez(os.path.join(OUT_DIR, f"modality_vector_{OUT_TAG}.npz"), v=v.numpy(), v_hat=v_hat.numpy(),
          gaps=gaps.numpy(), r_hat=r_hat.numpy(), rows=np.array(vec_rows))
 
 @contextmanager
@@ -264,17 +279,19 @@ for i, p in enumerate(tqdm(pairs, desc="conflict VQA", file=sys.stdout)):
     rec = dict(i=i, img_label=p["img_label"], txt_label=p["txt_label"])
     for c, d in CONDITIONS.items():
         with ablate(d):
-            ans = gen(make_inputs(img, caption_prompt(cap, FREE_Q)), 16).strip()
+            ans, ntok, eos = gen_full(make_inputs(img, caption_prompt(cap, FREE_Q)), MAX_NEW)
+        ans = ans.strip()
         rec[f"{c}/ans"] = ans
+        rec[f"{c}/eos"] = eos          # False => truncated at MAX_NEW
+        rec[f"{c}/ntok"] = ntok
         rec[c] = classify(ans, p["img_label"], p["txt_label"])
     results.append(rec)
     if i % 10 == 0 or i == len(pairs) - 1:
-        pd.DataFrame(results).to_csv(f"results_{OUT_TAG}.csv", index=False)
+        pd.DataFrame(results).to_csv(os.path.join(OUT_DIR, f"results_{OUT_TAG}.csv"), index=False)
     if i % 25 == 0:
         gc.collect(); torch.cuda.empty_cache()
 res = pd.DataFrame(results)
 
-from scipy.stats import binomtest
 COND = list(CONDITIONS)   # ["baseline", "random", "ablated"]
 
 def boot_ci(x, n_boot=5000, seed=SEED):
@@ -290,7 +307,7 @@ for c in COND:
     rows.append({"condition": c, "text-based": m, "CI lo": lo, "CI hi": hi,
                  "n (named either subject)": int(named.sum())})
 summary = pd.DataFrame(rows).set_index("condition")
-display(summary.round(3))
+print(summary.round(3))
 
 def mcnemar(c0, c1):
     both = res[c0].isin(["caption", "image"]) & res[c1].isin(["caption", "image"])
@@ -351,7 +368,7 @@ for c in CONDITIONS:
         "counts": {k: int(counts.get(k, 0)) for k in ["caption", "image", "both", "neither"]},
     }
 
-json_path = f"behavioral_{MODEL_ID.split('/')[-1]}.json"
+json_path = os.path.join(OUT_DIR, f"behavioral_{MODEL_ID.split('/')[-1]}.json")
 with open(json_path, "w") as f:
     json.dump(out, f, indent=2)
 
@@ -359,4 +376,6 @@ for c, s in out["conditions"].items():
     print(f"{c:<9} {s['caption_fraction']:.3f}  [{s['ci_lo']:.3f}, {s['ci_hi']:.3f}]  n={s['n_named']}")
 for k, s in out["mcnemar"].items():
     print(f"{k:<20} n={s['n_paired']}  cap→img {s['caption_to_image']}  img→cap {s['image_to_caption']}  p={s['p_value']:.2e}")
-files.download(json_path)
+if files is not None:
+    files.download(json_path)
+print(f"wrote {json_path}")

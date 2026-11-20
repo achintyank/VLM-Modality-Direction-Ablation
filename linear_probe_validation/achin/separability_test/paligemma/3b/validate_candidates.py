@@ -33,7 +33,7 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 # Load PaliGemma2 (same model the vectors were built for)
 # ---------------------------------------------------------------------------
 MODEL_ID = "google/paligemma2-3b-pt-224"
-VEC_DIR = "paligemma"                      # candidate_vectors/<VEC_DIR>/candidate_vectors.pt
+VEC_DIR = "paligemma/3b"                   # candidate_vectors/<VEC_DIR>/candidate_vectors.pt
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16

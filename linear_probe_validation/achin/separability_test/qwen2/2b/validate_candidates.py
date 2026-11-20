@@ -59,7 +59,7 @@ def _repo_root(start):
         d = os.path.dirname(d)
     raise RuntimeError(f"could not find candidate_vectors/ above {start}")
 
-VEC_PATH = os.path.join(_repo_root(__file__), "candidate_vectors", "qwen/2-2b", "candidate_vectors.pt")
+VEC_PATH = os.path.join(_repo_root(__file__), "candidate_vectors", "qwen2/2b", "candidate_vectors.pt")
 blob = torch.load(VEC_PATH, weights_only=False)
 
 # Tripwires: crash loudly now if the file doesn't match the model we just loaded,
